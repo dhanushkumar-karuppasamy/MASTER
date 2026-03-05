@@ -77,6 +77,10 @@ class Simulation:
         """Trigger a market crash event.  Delegates to OrchestratorAgent."""
         return self.orchestrator.trigger_crash()
 
+    def set_active_agents(self, active_agents: list[str]) -> dict:
+        """Enable/disable agents mid-simulation without re-init."""
+        return self.orchestrator.set_active_agents(active_agents)
+
     def get_snapshot(self) -> dict:
         """Return current simulation snapshot.  Delegates to OrchestratorAgent."""
         return self.orchestrator.get_snapshot()

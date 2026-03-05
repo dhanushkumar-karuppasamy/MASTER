@@ -166,6 +166,28 @@ def trigger_crash():
 
 
 # ------------------------------------------------------------------ #
+# POST /api/set-agents
+# ------------------------------------------------------------------ #
+@app.route("/api/set-agents", methods=["POST"])
+def set_agents():
+    """
+    Enable / disable agents mid-simulation without re-initialising.
+
+    Request body (JSON):
+        { "active_agents": ["conservative", "momentum", ...] }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    active_agents = data.get("active_agents", [])
+    try:
+        snapshot = simulation.set_active_agents(active_agents)
+        if "error" in snapshot:
+            return jsonify(snapshot), 400
+        return jsonify(snapshot)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ------------------------------------------------------------------ #
 # GET /api/state
 # ------------------------------------------------------------------ #
 @app.route("/api/state", methods=["GET"])
@@ -185,4 +207,4 @@ def get_state():
 # ------------------------------------------------------------------ #
 if __name__ == "__main__":
     print("Starting MASTER server on http://localhost:5001")
-    app.run(host="0.0.0.0", port=5001, debug=True, use_reloader=False)
+    app.run(host="0.0.0.0", port=5001, debug=True)

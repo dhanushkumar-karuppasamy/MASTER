@@ -61,7 +61,7 @@ function ProgressRing({ pct, color, size = 44, stroke = 3 }) {
   );
 }
 
-export default function AgentsPanel({ agents, tradeLog }) {
+export default function AgentsPanel({ agents, tradeLog, headAgent, systemRisk, regulationLog }) {
   const [expandedAgent, setExpandedAgent] = React.useState(null);
   const [expandedSection, setExpandedSection] = React.useState({}); // { agentName: 'trades' | 'pipeline' | null }
 
@@ -157,6 +157,156 @@ export default function AgentsPanel({ agents, tradeLog }) {
       </div>
 
       {/* ── Individual Agent Cards ── */}
+      {/* ── Orchestrator (Head Agent) Card ── */}
+      {headAgent && (
+        <div className="card" style={{ padding: '16px 18px', borderLeft: `3px solid ${C.cyan}` }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+            <div style={{
+              width: 44, height: 44, borderRadius: 10,
+              background: `${C.cyan}15`, border: `1px solid ${C.cyan}33`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22, flexShrink: 0,
+            }}>🧠</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: C.heading, fontFamily: "'Inter', system-ui, sans-serif" }}>
+                OrchestratorAgent
+              </div>
+              <div style={{ fontSize: 10, color: C.muted, fontFamily: "'JetBrains Mono', monospace", marginTop: 2 }}>
+                Head Agent · coordinates all trading agents and the market
+              </div>
+            </div>
+            <span style={{
+              padding: '2px 10px', borderRadius: 4, fontSize: 9, fontWeight: 700,
+              background: `${C.cyan}15`, color: C.cyan, border: `1px solid ${C.cyan}33`,
+              fontFamily: "'JetBrains Mono', monospace",
+            }}>ACTIVE</span>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 8, marginBottom: 10 }}>
+            {[
+              { label: 'Step', value: headAgent.current_step ?? '—', color: C.cyan },
+              { label: 'Max Steps', value: headAgent.max_steps ?? '—', color: C.text },
+              { label: 'Run ID', value: headAgent.run_id ? headAgent.run_id.slice(0, 8) + '…' : '—', color: C.muted },
+              { label: 'Circuit Breakers', value: headAgent.circuit_breakers_active ?? 0, color: (headAgent.circuit_breakers_active ?? 0) > 0 ? C.red : C.green },
+              { label: 'Crash Active', value: headAgent.crash_active ? 'YES' : 'NO', color: headAgent.crash_active ? C.red : C.green },
+              { label: 'Trading', value: headAgent.trading_halted ? 'HALTED' : 'ACTIVE', color: headAgent.trading_halted ? C.red : C.green },
+            ].map(m => (
+              <div key={m.label} style={{
+                padding: '8px 10px', borderRadius: 6, textAlign: 'center',
+                background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)',
+              }}>
+                <div style={{ fontSize: 12, fontWeight: 700, color: m.color, fontFamily: "'JetBrains Mono', monospace" }}>{m.value}</div>
+                <div style={{ fontSize: 8, color: C.muted, marginTop: 2, fontFamily: "'JetBrains Mono', monospace", textTransform: 'uppercase', letterSpacing: 0.4 }}>{m.label}</div>
+              </div>
+            ))}
+          </div>
+          {/* System Risk row */}
+          {systemRisk && (
+            <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+              {[
+                { label: 'Total AUM', value: `₹${Math.round(systemRisk.total_aum ?? 0).toLocaleString()}`, color: C.text },
+                { label: 'Exposure', value: `${fmt(systemRisk.exposure_pct, 1)}%`, color: C.amber },
+                { label: 'Global DD', value: `${fmt(systemRisk.global_drawdown_pct, 2)}%`, color: (systemRisk.global_drawdown_pct ?? 0) < -5 ? C.red : C.green },
+                { label: 'Active Agents', value: systemRisk.active_agents ?? '—', color: C.cyan },
+                { label: 'Violations', value: systemRisk.violation_count ?? 0, color: (systemRisk.violation_count ?? 0) > 0 ? C.amber : C.green },
+              ].map(m => (
+                <div key={m.label} style={{
+                  flex: '1 1 0', minWidth: 70, padding: '6px 8px', borderRadius: 6, textAlign: 'center',
+                  background: `${m.color}08`, border: `1px solid ${m.color}22`,
+                }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: m.color, fontFamily: "'JetBrains Mono', monospace" }}>{m.value}</div>
+                  <div style={{ fontSize: 8, color: C.muted, marginTop: 1, fontFamily: "'JetBrains Mono', monospace", textTransform: 'uppercase', letterSpacing: 0.4 }}>{m.label}</div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── Regulator (Compliance Agent) Card ── */}
+      {regulationLog !== undefined && (
+        <div className="card" style={{ padding: '16px 18px', borderLeft: `3px solid ${C.amber}` }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 12 }}>
+            <div style={{
+              width: 44, height: 44, borderRadius: 10,
+              background: `${C.amber}15`, border: `1px solid ${C.amber}33`,
+              display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 22, flexShrink: 0,
+            }}>⚖</div>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: C.heading, fontFamily: "'Inter', system-ui, sans-serif" }}>
+                RegulatorAgent
+              </div>
+              <div style={{ fontSize: 10, color: C.muted, fontFamily: "'JetBrains Mono', monospace", marginTop: 2 }}>
+                Compliance Agent · MaxPosition · BurstTrading · ManipulationPattern
+              </div>
+            </div>
+            <span style={{
+              padding: '2px 10px', borderRadius: 4, fontSize: 9, fontWeight: 700,
+              background: `${C.amber}15`, color: C.amber, border: `1px solid ${C.amber}33`,
+              fontFamily: "'JetBrains Mono', monospace",
+            }}>ACTIVE</span>
+          </div>
+          {/* Violation summary */}
+          {(() => {
+            const log = regulationLog || [];
+            const total = log.length;
+            const warns = log.filter(e => e.decision === 'WARN').length;
+            const blocks = log.filter(e => e.decision === 'BLOCK').length;
+            // per-agent breakdown
+            const byAgent = {};
+            for (const e of log) {
+              const n = e.agent_name || 'SYSTEM';
+              if (!byAgent[n]) byAgent[n] = { warns: 0, blocks: 0 };
+              if (e.decision === 'WARN') byAgent[n].warns++;
+              if (e.decision === 'BLOCK') byAgent[n].blocks++;
+            }
+            return (
+              <>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 10 }}>
+                  {[
+                    { label: 'Total Events', value: total, color: C.text },
+                    { label: 'Warnings', value: warns, color: C.amber },
+                    { label: 'Blocks', value: blocks, color: C.red },
+                  ].map(m => (
+                    <div key={m.label} style={{
+                      flex: 1, padding: '8px 10px', borderRadius: 6, textAlign: 'center',
+                      background: `${m.color}08`, border: `1px solid ${m.color}22`,
+                    }}>
+                      <div style={{ fontSize: 18, fontWeight: 700, color: m.color, fontFamily: "'JetBrains Mono', monospace" }}>{m.value}</div>
+                      <div style={{ fontSize: 8, color: C.muted, marginTop: 2, fontFamily: "'JetBrains Mono', monospace", textTransform: 'uppercase', letterSpacing: 0.4 }}>{m.label}</div>
+                    </div>
+                  ))}
+                </div>
+                {Object.keys(byAgent).length > 0 && (
+                  <div style={{ borderRadius: 6, border: '1px solid rgba(255,255,255,0.06)', overflow: 'hidden' }}>
+                    <div style={{ padding: '6px 10px', background: 'rgba(255,255,255,0.03)', fontSize: 9, color: C.muted, fontFamily: "'JetBrains Mono', monospace", textTransform: 'uppercase', letterSpacing: 0.5 }}>
+                      Per-Agent Violations
+                    </div>
+                    {Object.entries(byAgent).map(([name, counts]) => (
+                      <div key={name} style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        padding: '6px 10px', borderTop: '1px solid rgba(255,255,255,0.04)',
+                        fontSize: 10, fontFamily: "'JetBrains Mono', monospace",
+                      }}>
+                        <span style={{ color: C.text }}>{name}</span>
+                        <span style={{ display: 'flex', gap: 8 }}>
+                          <span style={{ color: C.amber }}>⚠ {counts.warns}</span>
+                          <span style={{ color: C.red }}>⊘ {counts.blocks}</span>
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {total === 0 && (
+                  <div style={{ textAlign: 'center', color: C.muted, fontSize: 11, fontFamily: "'JetBrains Mono', monospace", padding: '8px 0' }}>
+                    No violations recorded yet.
+                  </div>
+                )}
+              </>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* ── Trading Agent Cards ── */}
       {agents.map(agent => {
         const meta = AGENT_META[agent.name] || { icon: '◈', accent: C.cyan, strategy: '', style: '' };
         const trades = agentTrades[agent.name] || [];

@@ -48,3 +48,9 @@ export async function getState() {
   const res = await api.get('/api/state');
   return res.data;
 }
+
+/** Enable/disable agents mid-simulation without re-init */
+export async function setActiveAgents(activeAgents) {
+  const res = await api.post('/api/set-agents', { active_agents: activeAgents });
+  return res.data;
+}

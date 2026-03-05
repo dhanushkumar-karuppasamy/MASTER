@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { initSimulation, stepSimulation, jumpToStep, triggerCrash } from './api/client';
+import { initSimulation, stepSimulation, jumpToStep, triggerCrash, setActiveAgents as setActiveAgentsApi } from './api/client';
 import TopBar from './components/TopBar';
 import LeftSidebar from './components/LeftSidebar';
 import RightTradePanel from './components/RightTradePanel';
@@ -203,11 +203,20 @@ export default function App() {
     }
   }, []);
 
-  const toggleAgent = (key) => {
-    setActiveAgents(prev =>
-      prev.includes(key) ? prev.filter(k => k !== key) : [...prev, key]
-    );
-  };
+  const toggleAgent = useCallback(async (key) => {
+    const next = activeAgents.includes(key)
+      ? activeAgents.filter(k => k !== key)
+      : [...activeAgents, key];
+    setActiveAgents(next);
+    // If simulation is already initialised, push the change to the backend
+    // immediately so the backend stops/starts that agent without a full re-init.
+    if (status !== 'idle' && snapshot) {
+      try {
+        const data = await setActiveAgentsApi(next);
+        if (!data.error) setSnapshot(data);
+      } catch { /* non-fatal: UI stays in sync, backend will drift until next init */ }
+    }
+  }, [activeAgents, status, snapshot]);
 
   // ---- Derived data ----
   const step = snapshot?.step ?? 0;
@@ -275,7 +284,13 @@ export default function App() {
 
           {/* ── AGENTS TAB ── */}
           {activeTab === 'agents' && (
-            <AgentsPanel agents={snapshot?.agents} tradeLog={snapshot?.trade_log} />
+            <AgentsPanel
+              agents={snapshot?.agents}
+              tradeLog={snapshot?.trade_log}
+              headAgent={snapshot?.head_agent}
+              systemRisk={snapshot?.system_risk}
+              regulationLog={snapshot?.regulation_log}
+            />
           )}
 
           {/* ── STATS TAB ── */}

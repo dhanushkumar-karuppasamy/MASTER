@@ -220,8 +220,11 @@ class OrchestratorAgent:
             pv = agent.get_portfolio_value(close, self.ticker)
             agent.portfolio_value_history.append(pv)
 
+        # BUG FIX: only sum ACTIVE agents — get_system_risk() also filters by a.active.
+        # Including disabled agents inflates the peak so the drawdown is immediately
+        # negative at step 0 (e.g. 4 active × 100k vs peak of 5 × 100k = -20%).
         self._peak_total_value = sum(
-            a.get_portfolio_value(close, self.ticker) for a in self.agents
+            a.get_portfolio_value(close, self.ticker) for a in self.agents if a.active
         )
 
         # 6. Create a new run in the SQLite database
@@ -513,6 +516,46 @@ class OrchestratorAgent:
         }
 
     # ------------------------------------------------------------------ #
+    # Live agent toggle  (mid-simulation enable / disable)
+    # ------------------------------------------------------------------ #
+
+    def set_active_agents(self, active_keys: list[str]) -> dict:
+        """
+        Enable / disable agents by key without re-initialising the simulation.
+        Called when the user toggles an agent in the UI mid-run.
+        Also recomputes _peak_total_value so the global circuit-breaker
+        threshold stays correct after the active set changes.
+        """
+        keys = [k.lower() for k in active_keys]
+        if self.market is None:
+            return {"error": "Simulation not initialised."}
+
+        close = self.market.current_price
+        for agent in self.agents:
+            # Match by key: agent name lowercased with spaces removed
+            agent_key = agent.name.lower().replace(" ", "")
+            # Also check against AGENT_REGISTRY keys (display name may differ for custom)
+            matched = False
+            for reg_key, cls in AGENT_REGISTRY.items():
+                disp = AGENT_DISPLAY_NAMES[reg_key]
+                if isinstance(agent, cls) and reg_key in keys:
+                    matched = True
+                    break
+            agent.active = matched
+            # Un-halt re-activated agents so they can trade immediately
+            if agent.active and agent.halted:
+                agent.halted = False
+
+        # Recompute peak so global drawdown is based on the new active set
+        self._peak_total_value = max(
+            self._peak_total_value,
+            sum(a.get_portfolio_value(close, self.ticker) for a in self.agents if a.active)
+        )
+        # Also update stored active keys for reinit consistency
+        self._active_agent_keys = keys
+        return self.get_snapshot()
+
+    # ------------------------------------------------------------------ #
     # Batch step
     # ------------------------------------------------------------------ #
 
@@ -579,8 +622,9 @@ class OrchestratorAgent:
             pv = agent.get_portfolio_value(close, self.ticker)
             agent.portfolio_value_history.append(pv)
 
+        # BUG FIX: same as init() — only active agents contribute to peak value.
         self._peak_total_value = sum(
-            a.get_portfolio_value(close, self.ticker) for a in self.agents
+            a.get_portfolio_value(close, self.ticker) for a in self.agents if a.active
         )
 
         # New run in DB
