@@ -464,18 +464,22 @@ class OrchestratorAgent:
         # Global halt: if overall system drawdown exceeds threshold
         sys_risk = self.get_system_risk()
         if sys_risk.get("global_drawdown_pct", 0) <= self.GLOBAL_HALT_DRAWDOWN_PCT:
+            if not self.trading_halted:  # log only on the transition
+                self.logger.log_regulation_event(
+                    step=self.current_step,
+                    agent_name="SYSTEM",
+                    rule_name="GlobalCircuitBreaker",
+                    decision="BLOCK",
+                    explanation=(
+                        f"Global drawdown {sys_risk['global_drawdown_pct']:.1f}% "
+                        f"breached {self.GLOBAL_HALT_DRAWDOWN_PCT}% threshold – "
+                        f"ALL TRADING HALTED."
+                    ),
+                )
             self.trading_halted = True
-            self.logger.log_regulation_event(
-                step=self.current_step,
-                agent_name="SYSTEM",
-                rule_name="GlobalCircuitBreaker",
-                decision="BLOCK",
-                explanation=(
-                    f"Global drawdown {sys_risk['global_drawdown_pct']:.1f}% "
-                    f"breached {self.GLOBAL_HALT_DRAWDOWN_PCT}% threshold – "
-                    f"ALL TRADING HALTED."
-                ),
-            )
+        else:
+            # Drawdown has recovered — lift the halt automatically
+            self.trading_halted = False
 
         # ── Step 8: Advance market to next bar (endogenous price impact) ─
         # Pass net_volume so the market adjusts the next simulated price
@@ -541,18 +545,74 @@ class OrchestratorAgent:
                 if isinstance(agent, cls) and reg_key in keys:
                     matched = True
                     break
+            was_active = agent.active
             agent.active = matched
-            # Un-halt re-activated agents so they can trade immediately
-            if agent.active and agent.halted:
+            # Re-activated agents: clear halted flag AND reset the per-agent
+            # peak value so the circuit-breaker doesn't immediately re-fire
+            # (the peak was set when the agent last ran; the market may have
+            # moved since then, making the drawdown look >10% straight away).
+            if agent.active and not was_active:
                 agent.halted = False
+                agent._peak_value = agent.get_portfolio_value(close, self.ticker)
+            elif agent.active and agent.halted:
+                # Already active but halted (manual un-halt): same reset
+                agent.halted = False
+                agent._peak_value = agent.get_portfolio_value(close, self.ticker)
 
-        # Recompute peak so global drawdown is based on the new active set
-        self._peak_total_value = max(
-            self._peak_total_value,
-            sum(a.get_portfolio_value(close, self.ticker) for a in self.agents if a.active)
+        # Recompute peak based on the NEW active set only.
+        # Using max(old_peak, new_sum) is wrong — the old peak included
+        # disabled agents' funds, so the active-only sum would look like a
+        # massive drawdown and immediately fire the global circuit breaker.
+        # Instead, start a fresh drawdown window from the current active total.
+        active_total = sum(
+            a.get_portfolio_value(close, self.ticker) for a in self.agents if a.active
         )
+        self._peak_total_value = active_total if active_total > 0 else self._peak_total_value
+
+        # Clear any latched global halt so trading resumes after the
+        # user reconfigures the active-agent set.
+        self.trading_halted = False
+
         # Also update stored active keys for reinit consistency
         self._active_agent_keys = keys
+        return self.get_snapshot()
+
+    def liquidate_agent(self, agent_key: str) -> dict:
+        """
+        Immediately sell all open positions for the given agent at the
+        current market price, then return the updated snapshot.
+
+        Called when the user clicks "Sell & Disable" in the UI.
+        The agent is NOT deactivated here — the caller should follow up
+        with set_active_agents() to actually stop the agent from trading.
+        """
+        if self.market is None:
+            return {"error": "Simulation not initialised."}
+
+        close = self.market.current_price
+        agent_key_lower = agent_key.lower()
+
+        target = None
+        for agent in self.agents:
+            for reg_key, cls in AGENT_REGISTRY.items():
+                if reg_key == agent_key_lower and isinstance(agent, cls):
+                    target = agent
+                    break
+            if target:
+                break
+
+        if target is None:
+            return {"error": f"Agent '{agent_key}' not found."}
+
+        # Sell every ticker the agent holds
+        for ticker, qty in list(target.positions.items()):
+            if qty > 0:
+                target.execute_action(
+                    {"action": "SELL", "ticker": ticker, "quantity": qty,
+                     "reasoning": "Liquidation requested by user before disable."},
+                    close,
+                )
+
         return self.get_snapshot()
 
     # ------------------------------------------------------------------ #

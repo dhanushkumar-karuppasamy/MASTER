@@ -54,3 +54,9 @@ export async function setActiveAgents(activeAgents) {
   const res = await api.post('/api/set-agents', { active_agents: activeAgents });
   return res.data;
 }
+
+/** Liquidate (sell all positions for) a specific agent at current market price */
+export async function liquidateAgent(agentKey) {
+  const res = await api.post('/api/liquidate-agent', { agent_key: agentKey });
+  return res.data;
+}

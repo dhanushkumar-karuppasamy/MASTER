@@ -310,6 +310,7 @@ class TradingAgent:
 
         return {
             "name": self.name,
+            "initial_cash": round(self.initial_cash, 2),
             "cash": round(self.cash, 2),
             "positions": dict(self.positions),
             "portfolio_value": round(pv, 2),

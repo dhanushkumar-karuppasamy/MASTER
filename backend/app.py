@@ -188,6 +188,30 @@ def set_agents():
 
 
 # ------------------------------------------------------------------ #
+# POST /api/liquidate-agent
+# ------------------------------------------------------------------ #
+@app.route("/api/liquidate-agent", methods=["POST"])
+def liquidate_agent():
+    """
+    Sell all open positions for a specific agent at current market price.
+
+    Request body (JSON):
+        { "agent_key": "momentum" }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    agent_key = data.get("agent_key", "")
+    if not agent_key:
+        return jsonify({"error": "agent_key is required."}), 400
+    try:
+        snapshot = simulation.liquidate_agent(agent_key)
+        if "error" in snapshot:
+            return jsonify(snapshot), 400
+        return jsonify(snapshot)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ------------------------------------------------------------------ #
 # GET /api/state
 # ------------------------------------------------------------------ #
 @app.route("/api/state", methods=["GET"])

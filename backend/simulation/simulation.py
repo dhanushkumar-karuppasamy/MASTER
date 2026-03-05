@@ -81,6 +81,10 @@ class Simulation:
         """Enable/disable agents mid-simulation without re-init."""
         return self.orchestrator.set_active_agents(active_agents)
 
+    def liquidate_agent(self, agent_key: str) -> dict:
+        """Sell all open positions for an agent at current market price."""
+        return self.orchestrator.liquidate_agent(agent_key)
+
     def get_snapshot(self) -> dict:
         """Return current simulation snapshot.  Delegates to OrchestratorAgent."""
         return self.orchestrator.get_snapshot()
