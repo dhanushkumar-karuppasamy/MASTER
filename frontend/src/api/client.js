@@ -7,7 +7,7 @@ import axios from 'axios';
 const api = axios.create({
   baseURL: 'http://localhost:5001',
   headers: { 'Content-Type': 'application/json' },
-  timeout: 60000,
+  timeout: 180000,
 });
 
 /** Initialise simulation with given parameters, active agents, and per-agent params */
@@ -58,5 +58,11 @@ export async function setActiveAgents(activeAgents) {
 /** Liquidate (sell all positions for) a specific agent at current market price */
 export async function liquidateAgent(agentKey) {
   const res = await api.post('/api/liquidate-agent', { agent_key: agentKey });
+  return res.data;
+}
+
+/** Get available Ollama models for LLM agent */
+export async function getOllamaModels() {
+  const res = await api.get('/api/ollama-models');
   return res.data;
 }

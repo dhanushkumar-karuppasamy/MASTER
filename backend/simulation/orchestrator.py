@@ -296,7 +296,9 @@ class OrchestratorAgent:
             step_result = self.market.step(0.0)
             self.current_step = self.market.current_step
             market_state = self.market.get_state()
-            self.price_history.append(market_state["current_bar"])
+            halt_bar = market_state["current_bar"]
+            if not self.price_history or halt_bar.get("Datetime") != self.price_history[-1].get("Datetime"):
+                self.price_history.append(halt_bar)
             if step_result.get("finished"):
                 self.finished = True
             return self.get_snapshot()
@@ -491,7 +493,9 @@ class OrchestratorAgent:
         # Append new price bar to history (fetch full bar from get_state)
         market_state = self.market.get_state()
         new_bar = market_state["current_bar"]
-        self.price_history.append(new_bar)
+        # Guard: skip duplicate timestamps (can happen at last bar or day boundaries)
+        if not self.price_history or new_bar.get("Datetime") != self.price_history[-1].get("Datetime"):
+            self.price_history.append(new_bar)
 
         # Update peak total value for global drawdown tracking
         sim_close = self.market.current_price

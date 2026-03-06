@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { getOllamaModels } from '../api/client';
 
 const C = {
   green: '#4ade80', red: '#f87171', cyan: '#38bdf8',
@@ -128,10 +129,43 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
   const [strategyName, setStrategyName] = useState('');
   const [nameError, setNameError] = useState(false);
 
+  // LLM mode state
+  const [llmModels, setLlmModels] = useState([]);
+  const [llmAvailable, setLlmAvailable] = useState(false);
+  const [llmModel, setLlmModel] = useState('qwen2.5:3b');
+  const [llmStyle, setLlmStyle] = useState('balanced');
+  const [llmCustomPrompt, setLlmCustomPrompt] = useState('');
+  const [llmLoading, setLlmLoading] = useState(false);
+  const [llmCallInterval, setLlmCallInterval] = useState(3);
+
+  // Fetch Ollama models when LLM mode is selected
+  useEffect(() => {
+    if (mode === 'llm') {
+      setLlmLoading(true);
+      getOllamaModels()
+        .then(data => {
+          setLlmModels(data.models || []);
+          setLlmAvailable(data.available || false);
+          if (data.models && data.models.length > 0 && !data.models.find(m => m.name === llmModel)) {
+            setLlmModel(data.models[0].name);
+          }
+        })
+        .catch(() => { setLlmModels([]); setLlmAvailable(false); })
+        .finally(() => setLlmLoading(false));
+    }
+  }, [mode]);
+
   const buildRecipe = () => {
     const recipe = { mode };
     if (mode === 'basic') {
       recipe.basic = { ...basic };
+    } else if (mode === 'llm') {
+      recipe.llm = {
+        model: llmModel,
+        style: llmStyle,
+        custom_prompt: llmCustomPrompt,
+        call_interval: llmCallInterval,
+      };
     } else {
       recipe.advanced = {
         rules: rules.map(r => ({
@@ -179,21 +213,21 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
     if (!trimmedName) { setNameError(true); return; }
     setNameError(false);
     const recipe = buildRecipe();
-    setAgentParams(prev => ({
-      ...prev,
-      custom: {
-        ...(prev.custom || {}),
-        recipe,
-        name: trimmedName,
-        goal: goal || trimmedName,
-        position_size_pct: mode === 'basic' ? basic.position_size_pct : 0.10,
-      },
-    }));
+    const customParams = {
+      ...(agentParams.custom || {}),
+      recipe,
+      name: trimmedName,
+      goal: goal || trimmedName,
+      position_size_pct: mode === 'basic' ? basic.position_size_pct : 0.10,
+    };
+    // Update state for UI consistency
+    setAgentParams(prev => ({ ...prev, custom: customParams }));
+    const newActiveAgents = activeAgents.includes('custom') ? activeAgents : [...activeAgents, 'custom'];
     if (!activeAgents.includes('custom')) {
-      setActiveAgents(prev => [...prev, 'custom']);
+      setActiveAgents(newActiveAgents);
     }
-    // Defer init so state update settles first
-    setTimeout(() => onApplyAndInit(), 50);
+    // Call init directly with computed values (bypass stale React closure)
+    onApplyAndInit({ activeAgents: newActiveAgents, customParams });
   };
 
   // -- Advanced: rule manipulation helpers --
@@ -230,26 +264,28 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
       {/* Mode selector */}
       <div className="card" style={{ padding: '14px 20px' }}>
         <div style={{ display: 'flex', gap: 8, marginBottom: 4 }}>
-          {['basic', 'advanced'].map(m => (
+          {['basic', 'advanced', 'llm'].map(m => (
             <button
               key={m}
               onClick={() => setMode(m)}
               style={{
                 padding: '7px 20px', borderRadius: 5, cursor: 'pointer',
-                background: mode === m ? `${C.cyan}15` : 'rgba(255,255,255,0.03)',
-                border: `1px solid ${mode === m ? C.cyan + '40' : C.border}`,
-                color: mode === m ? C.cyan : C.muted,
+                background: mode === m ? `${m === 'llm' ? C.amber : C.cyan}15` : 'rgba(255,255,255,0.03)',
+                border: `1px solid ${mode === m ? (m === 'llm' ? C.amber : C.cyan) + '40' : C.border}`,
+                color: mode === m ? (m === 'llm' ? C.amber : C.cyan) : C.muted,
                 fontFamily: "'JetBrains Mono', monospace", fontSize: 11, fontWeight: 700,
                 transition: 'all 0.15s',
               }}
             >
-              {m.charAt(0).toUpperCase() + m.slice(1)}
+              {m === 'llm' ? '🧠 LLM' : m.charAt(0).toUpperCase() + m.slice(1)}
             </button>
           ))}
         </div>
         <p style={{ fontSize: 10, color: C.muted, fontFamily: "'JetBrains Mono', monospace", marginTop: 6 }}>
           {mode === 'basic'
             ? 'Simple entry/exit rule selection with position size.'
+            : mode === 'llm'
+            ? 'Local LLM (Ollama) makes autonomous trading decisions each step.'
             : 'IF-THEN rule builder: mix indicators, operators, and actions with AND/OR logic.'}
         </p>
       </div>
@@ -364,6 +400,108 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* LLM Mode */}
+      {mode === 'llm' && (
+        <div className="card" style={{ padding: '18px 20px' }}>
+          <h3 style={{ fontSize: 12, color: C.amber, marginBottom: 14, fontFamily: "'JetBrains Mono', monospace", textTransform: 'uppercase', letterSpacing: 0.8, display: 'flex', alignItems: 'center', gap: 8 }}>
+            🧠 Local LLM Agent (Ollama)
+          </h3>
+
+          {llmLoading ? (
+            <p style={{ fontSize: 11, color: C.muted, fontFamily: "'JetBrains Mono', monospace" }}>Connecting to Ollama...</p>
+          ) : !llmAvailable ? (
+            <div style={{ padding: '12px 14px', borderRadius: 6, background: 'rgba(248,113,113,0.08)', border: '1px solid rgba(248,113,113,0.2)' }}>
+              <p style={{ fontSize: 11, color: C.red, fontFamily: "'JetBrains Mono', monospace", margin: 0 }}>
+                ✕ Ollama is not running. Start it with: <code style={{ color: C.amber }}>ollama serve</code>
+              </p>
+            </div>
+          ) : (
+            <>
+              <Row label="Model">
+                <select
+                  value={llmModel}
+                  onChange={e => setLlmModel(e.target.value)}
+                  style={{
+                    flex: 1, padding: '6px 10px',
+                    background: 'rgba(15,20,30,0.8)',
+                    border: `1px solid ${C.border}`,
+                    borderRadius: 5, color: C.text,
+                    fontFamily: "'JetBrains Mono', monospace", fontSize: 11,
+                    cursor: 'pointer',
+                  }}
+                >
+                  {llmModels.map(m => (
+                    <option key={m.name} value={m.name}>
+                      {m.name} ({m.parameters}, {m.size_gb} GB)
+                    </option>
+                  ))}
+                </select>
+              </Row>
+
+              <Row label="Trading Style">
+                <div style={{ display: 'flex', gap: 6, flex: 1 }}>
+                  {['conservative', 'balanced', 'aggressive'].map(s => (
+                    <button
+                      key={s}
+                      onClick={() => setLlmStyle(s)}
+                      style={{
+                        flex: 1, padding: '6px 12px', borderRadius: 5, cursor: 'pointer',
+                        background: llmStyle === s ? `${s === 'aggressive' ? C.red : s === 'conservative' ? C.green : C.amber}15` : 'rgba(255,255,255,0.03)',
+                        border: `1px solid ${llmStyle === s ? (s === 'aggressive' ? C.red : s === 'conservative' ? C.green : C.amber) + '40' : C.border}`,
+                        color: llmStyle === s ? (s === 'aggressive' ? C.red : s === 'conservative' ? C.green : C.amber) : C.muted,
+                        fontFamily: "'JetBrains Mono', monospace", fontSize: 10, fontWeight: 700,
+                        transition: 'all 0.15s', textTransform: 'capitalize',
+                      }}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </Row>
+
+              <Row label="Instructions">
+                <textarea
+                  placeholder="Optional: e.g. 'Only buy tech stocks on dips' or 'Never hold more than 50% in stock'"
+                  value={llmCustomPrompt}
+                  onChange={e => setLlmCustomPrompt(e.target.value)}
+                  rows={3}
+                  style={{
+                    flex: 1, padding: '7px 10px',
+                    background: 'rgba(15,20,30,0.8)',
+                    border: `1px solid ${C.border}`,
+                    borderRadius: 5, color: C.text,
+                    fontFamily: "'JetBrains Mono', monospace", fontSize: 11,
+                    resize: 'vertical',
+                  }}
+                />
+              </Row>
+
+              <Row label="LLM Frequency">
+                <input
+                  type="range" min={1} max={10} step={1}
+                  value={llmCallInterval}
+                  onChange={e => setLlmCallInterval(parseInt(e.target.value))}
+                  style={{ flex: 1, accentColor: C.amber }}
+                />
+                <span style={{ fontSize: 11, color: C.amber, fontFamily: "'JetBrains Mono', monospace", minWidth: 80 }}>
+                  every {llmCallInterval} step{llmCallInterval > 1 ? 's' : ''}
+                </span>
+              </Row>
+
+              <div style={{
+                marginTop: 8, padding: '10px 14px', borderRadius: 6,
+                background: 'rgba(251,191,36,0.06)', border: '1px solid rgba(251,191,36,0.15)',
+              }}>
+                <p style={{ fontSize: 10, color: C.amber, fontFamily: "'JetBrains Mono', monospace", margin: 0, lineHeight: 1.6 }}>
+                  ⚡ The LLM is queried every {llmCallInterval} step{llmCallInterval > 1 ? 's' : ''} (cached in between for speed).
+                  Model is pre-loaded into GPU on init. Use 3B for fast responses.
+                </p>
+              </div>
+            </>
+          )}
         </div>
       )}
 

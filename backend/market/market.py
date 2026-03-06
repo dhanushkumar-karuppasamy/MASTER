@@ -61,6 +61,9 @@ def download_market_data(ticker: str, period: str, interval: str) -> pd.DataFram
     keep = [c for c in ["Datetime", "Open", "High", "Low", "Close", "Volume"] if c in df.columns]
     df = df[keep].copy()
 
+    # Drop duplicate timestamps (yfinance can return duplicates at day boundaries)
+    df = df.drop_duplicates(subset=["Datetime"], keep="last").reset_index(drop=True)
+
     return df
 
 

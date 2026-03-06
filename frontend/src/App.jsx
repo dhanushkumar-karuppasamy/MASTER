@@ -110,12 +110,17 @@ export default function App() {
 
   // ---- Handlers ----
 
-  const handleInit = useCallback(async () => {
+  const handleInit = useCallback(async (overrides = {}) => {
     setError(null);
-    if (autoRef.current) { clearInterval(autoRef.current); autoRef.current = null; }
+    if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; }
     try {
       const params = buildParamsWithFollowers();
-      const data = await initSimulation(ticker, period, interval_, activeAgents, params);
+      // Apply custom params override (from BuilderPanel save-and-init)
+      if (overrides.customParams) {
+        params.custom = { ...(params.custom || {}), ...overrides.customParams };
+      }
+      const agents = overrides.activeAgents || activeAgents;
+      const data = await initSimulation(ticker, period, interval_, agents, params);
       if (data.error) {
         setError(data.error);
         setStatus('idle');
@@ -135,46 +140,89 @@ export default function App() {
     setError(null);
     try {
       const data = await stepSimulation(batchSize);
-      if (data.error) { setError(data.error); return; }
+      if (data.error) {
+        // Auto-recovery if backend lost state
+        if (typeof data.error === 'string' && data.error.includes('not initialised')) {
+          setError('Backend lost state — re-initializing...');
+          try {
+            const params = buildParamsWithFollowers();
+            const reinit = await initSimulation(ticker, period, interval_, activeAgents, params);
+            if (!reinit.error) { setSnapshot(reinit); setError(null); setStatus('paused'); }
+            else { setError(reinit.error); }
+          } catch (e2) { setError(e2.message); }
+          return;
+        }
+        setError(data.error); return;
+      }
       setSnapshot(data);
       setMaxReachedStep(prev => Math.max(prev, data.step ?? 0));
       if (data.finished) {
         setStatus('finished');
         setShowSummary(true);
-        if (autoRef.current) { clearInterval(autoRef.current); autoRef.current = null; }
+        if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; }
       }
     } catch (err) {
-      setError(err.response?.data?.error || err.message);
+      const msg = err.response?.data?.error || err.message;
+      // Auto-recovery on catch path too
+      if (typeof msg === 'string' && msg.includes('not initialised')) {
+        setError('Re-initializing...');
+        try {
+          const params = buildParamsWithFollowers();
+          const reinit = await initSimulation(ticker, period, interval_, activeAgents, params);
+          if (!reinit.error) { setSnapshot(reinit); setError(null); setStatus('paused'); }
+          else { setError(reinit.error); }
+        } catch { /* give up */ }
+        return;
+      }
+      setError(msg);
     }
-  }, [batchSize]);
+  }, [batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers]);
 
   const handleAutoRun = useCallback(() => {
     setStatus('running');
-    autoRef.current = setInterval(async () => {
+    const runNext = async () => {
       try {
         const data = await stepSimulation(batchSize);
         if (data.error) {
-          clearInterval(autoRef.current); autoRef.current = null;
+          // If backend lost state (e.g. server restart), auto-re-init and resume
+          if (typeof data.error === 'string' && data.error.includes('not initialised')) {
+            setError('Backend restarted — re-initializing...');
+            try {
+              const params = buildParamsWithFollowers();
+              const reinit = await initSimulation(ticker, period, interval_, activeAgents, params);
+              if (!reinit.error) {
+                setSnapshot(reinit);
+                setError(null);
+                autoRef.current = setTimeout(runNext, speedMs);
+                return;
+              }
+            } catch { /* fall through to pause */ }
+          }
+          autoRef.current = null;
           setError(data.error); setStatus('paused');
           return;
         }
         setSnapshot(data);
         setMaxReachedStep(prev => Math.max(prev, data.step ?? 0));
         if (data.finished) {
-          clearInterval(autoRef.current); autoRef.current = null;
+          autoRef.current = null;
           setStatus('finished');
           setShowSummary(true);
+          return;
         }
+        // Schedule next step only after current one completes
+        autoRef.current = setTimeout(runNext, speedMs);
       } catch (err) {
-        clearInterval(autoRef.current); autoRef.current = null;
+        autoRef.current = null;
         setError(err.response?.data?.error || err.message);
         setStatus('paused');
       }
-    }, speedMs);
-  }, [speedMs, batchSize]);
+    };
+    autoRef.current = setTimeout(runNext, 0);
+  }, [speedMs, batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers]);
 
   const handlePause = useCallback(() => {
-    if (autoRef.current) { clearInterval(autoRef.current); autoRef.current = null; }
+    if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; }
     setStatus('paused');
   }, []);
 
@@ -183,7 +231,7 @@ export default function App() {
     if (targetStep > maxReachedStep) return;
     if (jumpingRef.current) return;
     jumpingRef.current = true;
-    if (autoRef.current) { clearInterval(autoRef.current); autoRef.current = null; setStatus('paused'); }
+    if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; setStatus('paused'); }
     try {
       const data = await jumpToStep(targetStep);
       if (data.error) { setError(data.error); return; }
@@ -432,7 +480,7 @@ export default function App() {
         />
       )}
 
-      {showSummary && (
+      {showSummary && snapshot && (
         <SimulationSummaryModal
           snapshot={snapshot}
           onClose={() => setShowSummary(false)}

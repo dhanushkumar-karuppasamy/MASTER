@@ -46,7 +46,97 @@ Supported indicator keys (mapped from current_bar):
 Supported ops: "<", "<=", ">", ">=", "==", "!="
 """
 
+import json
+import requests
+import logging
+
 from agents.base_agent import TradingAgent
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Ollama LLM helpers
+# ---------------------------------------------------------------------------
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+DEFAULT_MODEL = "qwen2.5:3b"
+
+_LLM_SYSTEM_PROMPT = """You are a stock trading AI. Respond with ONLY JSON.
+Format: {"action":"BUY"|"SELL"|"HOLD","confidence":0.0-1.0,"reasoning":"brief"}
+Use SMA crossover, Bollinger Bands, volatility. Be concise (under 40 words)."""
+
+
+def _warmup_model(model: str) -> None:
+    """Send a tiny request to pre-load the model into VRAM (avoids cold-start)."""
+    try:
+        logger.info("[LLM] Pre-warming model %s ...", model)
+        requests.post(
+            OLLAMA_URL,
+            json={
+                "model": model,
+                "prompt": "hi",
+                "stream": False,
+                "keep_alive": "30m",
+                "options": {"num_predict": 1},
+            },
+            timeout=120,
+        )
+        logger.info("[LLM] Model %s is warm and ready.", model)
+    except Exception as e:
+        logger.warning("[LLM] Warmup failed: %s", e)
+
+
+def _call_ollama(model: str, prompt: str, timeout: float = 90.0) -> dict:
+    """Call Ollama generate API and parse the JSON response."""
+    try:
+        resp = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": model,
+                "prompt": prompt,
+                "system": _LLM_SYSTEM_PROMPT,
+                "stream": False,
+                "keep_alive": "30m",
+                "options": {
+                    "temperature": 0.2,
+                    "num_predict": 120,
+                    "top_p": 0.9,
+                },
+            },
+            timeout=timeout,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "")
+        logger.info(f"[LLM raw] {raw[:300]}")
+
+        # Try to extract JSON from the response
+        # Sometimes LLMs wrap it in ```json ...```
+        cleaned = raw.strip()
+        if "```" in cleaned:
+            start = cleaned.find("{")
+            end = cleaned.rfind("}") + 1
+            if start >= 0 and end > start:
+                cleaned = cleaned[start:end]
+        
+        parsed = json.loads(cleaned)
+        return {
+            "action": str(parsed.get("action", "HOLD")).upper(),
+            "confidence": float(parsed.get("confidence", 0.5)),
+            "reasoning": str(parsed.get("reasoning", "LLM provided no reasoning.")),
+        }
+    except requests.exceptions.ConnectionError:
+        logger.error("Ollama not reachable at %s", OLLAMA_URL)
+        return {"action": "HOLD", "confidence": 0.0, "reasoning": "LLM unreachable (Ollama not running?)"}
+    except requests.exceptions.Timeout:
+        logger.error("Ollama request timed out")
+        return {"action": "HOLD", "confidence": 0.0, "reasoning": "LLM request timed out"}
+    except (json.JSONDecodeError, ValueError, KeyError) as e:
+        logger.error("Failed to parse LLM response: %s — raw: %s", e, raw[:200])
+        return {"action": "HOLD", "confidence": 0.0, "reasoning": f"LLM response parse error: {e}"}
+    except Exception as e:
+        logger.error("Unexpected LLM error: %s", e)
+        return {"action": "HOLD", "confidence": 0.0, "reasoning": f"LLM error: {e}"}
+
 
 # ---------------------------------------------------------------------------
 # Indicator resolution helpers
@@ -128,6 +218,23 @@ class CustomAgent(TradingAgent):
         # Default position size if not specified in recipe
         self._default_size = float(params.get("position_size_pct", 0.10))
 
+        # LLM settings (populated from recipe when mode == "llm")
+        llm_cfg = self._recipe.get("llm", {})
+        self._llm_model = llm_cfg.get("model", DEFAULT_MODEL)
+        self._llm_style = llm_cfg.get("style", "balanced")
+        self._llm_custom_prompt = llm_cfg.get("custom_prompt", "")
+        self._llm_timeout = float(llm_cfg.get("timeout", 90))
+
+        # LLM response cache — re-query only every N steps to avoid slowdown
+        self._llm_call_interval = int(llm_cfg.get("call_interval", 3))  # query LLM every N steps
+        self._llm_step_counter = 0
+        self._llm_cached_decision: dict | None = None
+
+        # Pre-warm the model into VRAM on agent creation (avoids cold-start timeout)
+        if self._recipe.get("mode") == "llm":
+            import threading
+            threading.Thread(target=_warmup_model, args=(self._llm_model,), daemon=True).start()
+
     # -- perceive -----------------------------------------------------------
 
     def perceive(self, market_state: dict) -> dict:
@@ -164,7 +271,9 @@ class CustomAgent(TradingAgent):
             return {"action": "HOLD", "ticker": "", "quantity": 0, "reasoning": "No valid observation"}
 
         mode = self._recipe.get("mode", "basic")
-        if mode == "advanced":
+        if mode == "llm":
+            return self._reason_llm(observation)
+        elif mode == "advanced":
             return self._reason_advanced(observation)
         return self._reason_basic(observation)
 
@@ -282,4 +391,89 @@ class CustomAgent(TradingAgent):
         return {
             "action": "HOLD", "ticker": ticker, "quantity": 0,
             "reasoning": "Advanced custom strategy: no rule matched"
+        }
+
+    # -- LLM mode -----------------------------------------------------------
+
+    def _reason_llm(self, obs: dict) -> dict:
+        """Use a local LLM via Ollama to decide the trading action."""
+        ticker = obs["ticker"]
+        close  = obs["close"]
+        held_qty = obs.get("held_qty", 0)
+
+        # ---- Cache: reuse last LLM decision for N steps to avoid slowdown ----
+        self._llm_step_counter += 1
+        if (self._llm_cached_decision is not None
+                and self._llm_step_counter % self._llm_call_interval != 0):
+            cached = self._llm_cached_decision.copy()
+            # Recalculate quantity with current prices/portfolio
+            cached["ticker"] = ticker
+            action = cached["action"]
+            if action == "BUY" and close > 0:
+                size_pct = self._default_size * cached.get("_confidence", 0.5)
+                qty = int((self.cash * size_pct) / close)
+                cached["quantity"] = qty if qty > 0 else 0
+                if qty <= 0:
+                    cached["action"] = "HOLD"
+            elif action == "SELL":
+                qty = max(1, int(held_qty * cached.get("_confidence", 0.5))) if held_qty > 0 else 0
+                cached["quantity"] = qty
+                if qty <= 0:
+                    cached["action"] = "HOLD"
+            cached["reasoning"] = f"[LLM cached] {cached.get('reasoning', '')}"
+            return cached
+
+        # ---- Build compact prompt ----
+        avg_cost = self.avg_cost.get(ticker, close)
+        pnl = (close - avg_cost) * held_qty if held_qty > 0 else 0.0
+
+        style_map = {"aggressive": "aggressive momentum", "conservative": "cautious", "balanced": "balanced"}
+        style = style_map.get(self._llm_style, "balanced")
+        extra = f" User: {self._llm_custom_prompt}" if self._llm_custom_prompt else ""
+
+        prompt = (
+            f"{ticker} ${close:.2f} SMA20={obs.get('sma20',0):.2f} SMA50={obs.get('sma50',0):.2f} "
+            f"BB=[{obs.get('bb_low',0):.2f},{obs.get('bb_up',0):.2f}] Vol={obs.get('volatility',0):.4f} "
+            f"Cash=${self.cash:.0f} Shares={held_qty} AvgCost=${avg_cost:.2f} PnL=${pnl:.2f} "
+            f"Style:{style}{extra} -> JSON"
+        )
+
+        llm_result = _call_ollama(self._llm_model, prompt, timeout=self._llm_timeout)
+        action = llm_result["action"]
+        confidence = llm_result["confidence"]
+        reasoning = llm_result["reasoning"]
+
+        # Validate action
+        if action not in ("BUY", "SELL", "HOLD"):
+            action = "HOLD"
+
+        # Compute quantity based on confidence
+        quantity = 0
+        if action == "BUY" and close > 0:
+            size_pct = self._default_size * confidence
+            quantity = int((self.cash * size_pct) / close)
+            if quantity <= 0:
+                action = "HOLD"
+                reasoning += " (insufficient cash for BUY)"
+        elif action == "SELL":
+            quantity = max(1, int(held_qty * confidence)) if held_qty > 0 else 0
+            if quantity <= 0:
+                action = "HOLD"
+                reasoning += " (no position to SELL)"
+
+        # Cache this decision
+        self._llm_cached_decision = {
+            "action": action,
+            "ticker": ticker,
+            "quantity": quantity,
+            "reasoning": reasoning,
+            "_confidence": confidence,
+        }
+
+        tag = f"[LLM:{self._llm_model}] "
+        return {
+            "action": action,
+            "ticker": ticker,
+            "quantity": quantity,
+            "reasoning": tag + reasoning,
         }

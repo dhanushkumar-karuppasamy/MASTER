@@ -47,9 +47,13 @@ function buildSeries(priceHistory) {
   const bbLow   = [];
   const bbMid   = [];
 
+  let prevT = 0;
   for (const bar of priceHistory) {
     const t = toEpoch(bar.Datetime);
     if (!t) continue;
+    // lightweight-charts requires strictly ascending times — skip duplicates
+    if (t <= prevT) continue;
+    prevT = t;
 
     candles.push({
       time: t,

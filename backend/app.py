@@ -25,6 +25,7 @@ Endpoints:
 
 import sys
 import os
+import requests as http_requests
 
 # Ensure the backend directory is on the Python path so relative imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -227,8 +228,32 @@ def get_state():
 
 
 # ------------------------------------------------------------------ #
+# GET /api/ollama-models
+# ------------------------------------------------------------------ #
+@app.route("/api/ollama-models", methods=["GET"])
+def get_ollama_models():
+    """Return list of locally available Ollama models."""
+    try:
+        resp = http_requests.get("http://localhost:11434/api/tags", timeout=5)
+        resp.raise_for_status()
+        models = resp.json().get("models", [])
+        result = [
+            {
+                "name": m["name"],
+                "size_gb": round(m.get("size", 0) / 1e9, 1),
+                "family": m.get("details", {}).get("family", ""),
+                "parameters": m.get("details", {}).get("parameter_size", ""),
+            }
+            for m in models
+        ]
+        return jsonify({"models": result, "available": True})
+    except Exception:
+        return jsonify({"models": [], "available": False, "error": "Ollama not running"})
+
+
+# ------------------------------------------------------------------ #
 # Run
 # ------------------------------------------------------------------ #
 if __name__ == "__main__":
     print("Starting MASTER server on http://localhost:5001")
-    app.run(host="0.0.0.0", port=5001, debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=True, use_reloader=False)
