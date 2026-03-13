@@ -28,6 +28,8 @@ Responsibilities:
 import random
 import uuid
 import numpy as np
+import copy
+import pandas as pd
 
 from market.market import MarketEnvironment
 from agents.base_agent import TradingAgent
@@ -104,6 +106,9 @@ class OrchestratorAgent:
         self.ticker: str = ""
         self.period: str = ""
         self.interval: str = ""
+        self.start_date: str | None = None
+        self.end_date: str | None = None
+        self.custom_data_df: pd.DataFrame | None = None
 
         # Agents (autonomous, goal-driven, rule-based decision makers)
         self.agents: list[TradingAgent] = []
@@ -158,6 +163,9 @@ class OrchestratorAgent:
         interval: str,
         active_agents: list[str] | None = None,
         agent_params: dict | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        custom_data_df: pd.DataFrame | None = None,
     ) -> dict:
         """
         Download market data, create environment, instantiate agents and
@@ -167,10 +175,20 @@ class OrchestratorAgent:
         This is the entry point that sets up the entire multi-agent system.
         """
         # 1. Create market environment (downloads real data via yfinance)
-        self.market = MarketEnvironment(ticker, period, interval)
+        self.market = MarketEnvironment(
+            ticker,
+            period,
+            interval,
+            start_date=start_date,
+            end_date=end_date,
+            custom_data_df=custom_data_df,
+        )
         self.ticker = ticker
         self.period = period
         self.interval = interval
+        self.start_date = start_date
+        self.end_date = end_date
+        self.custom_data_df = custom_data_df
         self.current_step = 0
         self.max_steps = self.market.total_bars
         self.finished = False
@@ -632,6 +650,148 @@ class OrchestratorAgent:
             if snapshot.get("finished") or "error" in snapshot:
                 break
         return snapshot or self.get_snapshot()
+
+    # ------------------------------------------------------------------ #
+    # Optimization (headless parameter sweep)
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _set_nested_param(target: dict, path: str, value: float) -> None:
+        """Set nested dict value by dot path (creates missing keys)."""
+        if not path:
+            raise ValueError("parameter path is required")
+        parts = [p for p in str(path).split(".") if p]
+        if not parts:
+            raise ValueError("parameter path is invalid")
+        node = target
+        for p in parts[:-1]:
+            if p not in node or not isinstance(node[p], dict):
+                node[p] = {}
+            node = node[p]
+        node[parts[-1]] = value
+
+    @staticmethod
+    def _sweep_values(min_value: float, max_value: float, step_value: float) -> list[float]:
+        vals = []
+        v = float(min_value)
+        hi = float(max_value)
+        step = float(step_value)
+        if step <= 0:
+            raise ValueError("step must be > 0")
+        if v > hi:
+            raise ValueError("min must be <= max")
+        guard = 0
+        while v <= hi + (step * 1e-6):
+            vals.append(round(v, 10))
+            v += step
+            guard += 1
+            if guard > 10_000:
+                break
+        return vals
+
+    @staticmethod
+    def _compute_max_drawdown_pct(values: list[float]) -> float:
+        if not values:
+            return 0.0
+        peak = values[0]
+        worst_dd = 0.0
+        for val in values:
+            if val > peak:
+                peak = val
+            if peak > 0:
+                dd = (val - peak) / peak
+                if dd < worst_dd:
+                    worst_dd = dd
+        return abs(worst_dd * 100.0)
+
+    def optimize(
+        self,
+        ticker: str,
+        period: str,
+        interval: str,
+        active_agents: list[str] | None,
+        agent_params: dict | None,
+        parameter: str,
+        min_value: float,
+        max_value: float,
+        step_value: float,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        """Run a headless parameter sweep and return final-value/max-drawdown metrics."""
+        values = self._sweep_values(min_value, max_value, step_value)
+        base_params = copy.deepcopy(agent_params or {})
+        base_active = list(active_agents or AGENT_REGISTRY.keys())
+
+        results = []
+        for val in values:
+            try:
+                trial_params = copy.deepcopy(base_params)
+                self._set_nested_param(trial_params, parameter, val)
+
+                # Run trial in an isolated orchestrator with DB disabled for speed.
+                runner = OrchestratorAgent(db=None)
+                snapshot = runner.init(
+                    ticker=ticker,
+                    period=period,
+                    interval=interval,
+                    active_agents=base_active,
+                    agent_params=trial_params,
+                    start_date=start_date,
+                    end_date=end_date,
+                    custom_data_df=None,
+                )
+                if "error" in snapshot:
+                    results.append({
+                        "parameter_value": val,
+                        "error": snapshot["error"],
+                    })
+                    continue
+
+                value_series: list[float] = []
+                trial_finished = False
+                while not trial_finished:
+                    total_value = sum(
+                        float(a.get("portfolio_value", 0.0))
+                        for a in snapshot.get("agents", [])
+                        if a.get("status") != "DISABLED"
+                    )
+                    value_series.append(total_value)
+                    trial_finished = bool(snapshot.get("finished"))
+                    if trial_finished:
+                        break
+                    snapshot = runner.run_step()
+                    if "error" in snapshot:
+                        break
+
+                final_value = value_series[-1] if value_series else 0.0
+                initial_value = value_series[0] if value_series else 1.0
+                final_return_pct = ((final_value - initial_value) / initial_value * 100.0) if initial_value > 0 else 0.0
+                max_drawdown_pct = self._compute_max_drawdown_pct(value_series)
+
+                trial_result = {
+                    "parameter_value": val,
+                    "final_portfolio_value": round(final_value, 2),
+                    "final_return_pct": round(final_return_pct, 4),
+                    "max_drawdown_pct": round(max_drawdown_pct, 4),
+                    "steps": max(0, len(value_series) - 1),
+                }
+                if "error" in snapshot:
+                    trial_result["error"] = snapshot["error"]
+                results.append(trial_result)
+            except Exception as trial_exc:
+                results.append({
+                    "parameter_value": val,
+                    "error": str(trial_exc),
+                })
+
+        return {
+            "parameter": parameter,
+            "min": min_value,
+            "max": max_value,
+            "step": step_value,
+            "results": results,
+        }
 
     # ------------------------------------------------------------------ #
     # Jump to step

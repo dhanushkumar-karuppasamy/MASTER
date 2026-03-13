@@ -3,6 +3,7 @@ import React from 'react';
 const NAV_ITEMS = [
   { id: 'trades', icon: '⇅', label: 'Trades' },
   { id: 'market', icon: '◎', label: 'Market' },
+  { id: 'research', icon: '⚗', label: 'Research' },
   { id: 'agents', icon: '⬡', label: 'Agents' },
   { id: 'stats',  icon: '◈', label: 'Stats' },
   { id: 'builder', icon: '⚙', label: 'Builder' },

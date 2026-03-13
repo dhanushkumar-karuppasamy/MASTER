@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback, useEffect } from 'react';
-import { initSimulation, stepSimulation, jumpToStep, triggerCrash, setActiveAgents as setActiveAgentsApi, liquidateAgent as liquidateAgentApi } from './api/client';
+import { initSimulation, stepSimulation, jumpToStep, triggerCrash, setActiveAgents as setActiveAgentsApi, liquidateAgent as liquidateAgentApi, optimizeSimulation } from './api/client';
 import TopBar from './components/TopBar';
 import LeftSidebar from './components/LeftSidebar';
 import RightTradePanel from './components/RightTradePanel';
@@ -13,6 +13,7 @@ import SettingsModal from './components/SettingsModal';
 import MarketPanel from './components/MarketPanel';
 import StatsPanel from './components/StatsPanel';
 import HelpPanel from './components/HelpPanel';
+import ResearchPanel from './components/ResearchPanel';
 import BuilderPanel from './components/BuilderPanel';
 import DisableAgentModal from './components/DisableAgentModal';
 import SimulationSummaryModal from './components/SimulationSummaryModal';
@@ -44,6 +45,11 @@ const DEFAULT_FOLLOWERS = {
   custom: 1,
 };
 
+const STRESS_TEST_RANGES = {
+  '2008_crisis': { startDate: '2008-08-01', endDate: '2008-12-31' },
+  'covid_crash': { startDate: '2020-02-01', endDate: '2020-04-30' },
+};
+
 export default function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('theme') || 'dark');
   // disableConfirm: { key, label, positions, currentPrice } | null
@@ -60,6 +66,8 @@ export default function App() {
   const [ticker, setTicker] = useState('AAPL');
   const [period, setPeriod] = useState('5d');
   const [interval_, setInterval_] = useState('5m');
+  const [stressTest, setStressTest] = useState('');
+  const [customCsvFile, setCustomCsvFile] = useState(null);
 
   // ---- Agent config ----
   const [activeAgents, setActiveAgents] = useState(
@@ -68,6 +76,18 @@ export default function App() {
   const [agentParams, setAgentParams] = useState(JSON.parse(JSON.stringify(DEFAULT_PARAMS)));
   const [agentFollowers, setAgentFollowers] = useState({ ...DEFAULT_FOLLOWERS });
   const [showSettings, setShowSettings] = useState(false);
+
+  // ---- Optimizer state ----
+  const [optimizerConfig, setOptimizerConfig] = useState({
+    targetAgent: 'custom',
+    parameter: 'basic.position_size_pct',
+    min: 0.05,
+    max: 0.30,
+    step: 0.05,
+  });
+  const [optimizerResults, setOptimizerResults] = useState([]);
+  const [optimizerRunning, setOptimizerRunning] = useState(false);
+  const [optimizerError, setOptimizerError] = useState('');
 
   // ---- Speed Control ----
   const [speedMs, setSpeedMs] = useState(300); // ms per step
@@ -108,6 +128,18 @@ export default function App() {
     return merged;
   }, [agentParams, agentFollowers]);
 
+  const getInitOptions = useCallback(() => {
+    const stressRange = STRESS_TEST_RANGES[stressTest] || null;
+    if (stressRange) {
+      return {
+        startDate: stressRange.startDate,
+        endDate: stressRange.endDate,
+        csvFile: customCsvFile,
+      };
+    }
+    return { csvFile: customCsvFile };
+  }, [stressTest, customCsvFile]);
+
   // ---- Handlers ----
 
   const handleInit = useCallback(async (overrides = {}) => {
@@ -120,7 +152,7 @@ export default function App() {
         params.custom = { ...(params.custom || {}), ...overrides.customParams };
       }
       const agents = overrides.activeAgents || activeAgents;
-      const data = await initSimulation(ticker, period, interval_, agents, params);
+      const data = await initSimulation(ticker, period, interval_, agents, params, getInitOptions());
       if (data.error) {
         setError(data.error);
         setStatus('idle');
@@ -134,7 +166,7 @@ export default function App() {
       setError(err.response?.data?.error || err.message);
       setStatus('idle');
     }
-  }, [ticker, period, interval_, activeAgents, buildParamsWithFollowers]);
+  }, [ticker, period, interval_, activeAgents, buildParamsWithFollowers, getInitOptions]);
 
   const handleStep = useCallback(async () => {
     setError(null);
@@ -146,7 +178,7 @@ export default function App() {
           setError('Backend lost state — re-initializing...');
           try {
             const params = buildParamsWithFollowers();
-            const reinit = await initSimulation(ticker, period, interval_, activeAgents, params);
+            const reinit = await initSimulation(ticker, period, interval_, activeAgents, params, getInitOptions());
             if (!reinit.error) { setSnapshot(reinit); setError(null); setStatus('paused'); }
             else { setError(reinit.error); }
           } catch (e2) { setError(e2.message); }
@@ -168,7 +200,7 @@ export default function App() {
         setError('Re-initializing...');
         try {
           const params = buildParamsWithFollowers();
-          const reinit = await initSimulation(ticker, period, interval_, activeAgents, params);
+          const reinit = await initSimulation(ticker, period, interval_, activeAgents, params, getInitOptions());
           if (!reinit.error) { setSnapshot(reinit); setError(null); setStatus('paused'); }
           else { setError(reinit.error); }
         } catch { /* give up */ }
@@ -176,7 +208,7 @@ export default function App() {
       }
       setError(msg);
     }
-  }, [batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers]);
+  }, [batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers, getInitOptions]);
 
   const handleAutoRun = useCallback(() => {
     setStatus('running');
@@ -189,7 +221,7 @@ export default function App() {
             setError('Backend restarted — re-initializing...');
             try {
               const params = buildParamsWithFollowers();
-              const reinit = await initSimulation(ticker, period, interval_, activeAgents, params);
+              const reinit = await initSimulation(ticker, period, interval_, activeAgents, params, getInitOptions());
               if (!reinit.error) {
                 setSnapshot(reinit);
                 setError(null);
@@ -219,7 +251,54 @@ export default function App() {
       }
     };
     autoRef.current = setTimeout(runNext, 0);
-  }, [speedMs, batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers]);
+  }, [speedMs, batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers, getInitOptions]);
+
+  const handleRunOptimizer = useCallback(async () => {
+    setOptimizerRunning(true);
+    setOptimizerError('');
+    try {
+      const params = buildParamsWithFollowers();
+      const stressRange = STRESS_TEST_RANGES[stressTest] || null;
+      const targetAgent = String(optimizerConfig?.targetAgent || '').trim();
+      const paramName = String(optimizerConfig?.parameter || '').trim();
+      const parameterPath = targetAgent
+        ? (paramName.startsWith(`${targetAgent}.`) ? paramName : `${targetAgent}.${paramName}`)
+        : paramName;
+      const payload = {
+        ticker,
+        period,
+        interval: interval_,
+        active_agents: activeAgents,
+        agent_params: params,
+        parameter: parameterPath,
+        min: Number(optimizerConfig.min),
+        max: Number(optimizerConfig.max),
+        step: Number(optimizerConfig.step),
+      };
+      if (stressRange) {
+        payload.start_date = stressRange.startDate;
+        payload.end_date = stressRange.endDate;
+      }
+
+      const result = await optimizeSimulation(payload);
+      setOptimizerResults(Array.isArray(result?.results) ? result.results : []);
+    } catch (err) {
+      const rawMsg = err?.response?.data?.error || err?.message || 'Optimizer failed';
+      let friendly = rawMsg;
+      if (/Network Error/i.test(rawMsg)) {
+        friendly = 'Cannot reach backend at http://localhost:5001. Start or restart the backend server and try again.';
+      } else if (/404/i.test(rawMsg)) {
+        friendly = 'Optimizer endpoint not found. Please restart backend to load the latest /api/optimize route.';
+      } else if (/timeout/i.test(rawMsg)) {
+        friendly = 'Optimization timed out. Try a smaller range (min/max/step) or lower data period.';
+      }
+      setOptimizerError(friendly);
+      setOptimizerResults([]);
+      throw new Error(friendly);
+    } finally {
+      setOptimizerRunning(false);
+    }
+  }, [buildParamsWithFollowers, stressTest, ticker, period, interval_, activeAgents, optimizerConfig]);
 
   const handlePause = useCallback(() => {
     if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; }
@@ -337,6 +416,7 @@ export default function App() {
         setTicker={setTicker}
         period={period}
         setPeriod={setPeriod}
+        periodLocked={Boolean(stressTest)}
         theme={theme}
         setTheme={setTheme}
         balance={totalBalance}
@@ -432,6 +512,24 @@ export default function App() {
           {/* ── INFO TAB ── */}
           {activeTab === 'help' && (
             <HelpPanel />
+          )}
+
+          {/* ── RESEARCH TAB ── */}
+          {activeTab === 'research' && (
+            <ResearchPanel
+              stressTest={stressTest}
+              setStressTest={setStressTest}
+              csvFileName={customCsvFile?.name || ''}
+              onCsvFileChange={setCustomCsvFile}
+              optimizerConfig={optimizerConfig}
+              setOptimizerConfig={setOptimizerConfig}
+              onRunOptimizer={handleRunOptimizer}
+              optimizerResults={optimizerResults}
+              optimizerRunning={optimizerRunning}
+              optimizerError={optimizerError}
+              allAgents={ALL_AGENTS}
+              status={status}
+            />
           )}
 
           {/* ── BUILDER TAB ── */}

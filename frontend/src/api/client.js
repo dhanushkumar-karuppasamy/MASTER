@@ -6,16 +6,51 @@ import axios from 'axios';
 
 const api = axios.create({
   baseURL: 'http://localhost:5001',
-  headers: { 'Content-Type': 'application/json' },
   timeout: 180000,
 });
 
 /** Initialise simulation with given parameters, active agents, and per-agent params */
-export async function initSimulation(ticker, period, interval, activeAgents = null, agentParams = null) {
-  const body = { ticker, period, interval };
+export async function initSimulation(
+  ticker,
+  period,
+  interval,
+  activeAgents = null,
+  agentParams = null,
+  options = {},
+) {
+  const { startDate = null, endDate = null, csvFile = null } = options;
+
+  if (csvFile) {
+    const form = new FormData();
+    form.append('ticker', ticker);
+    form.append('interval', interval);
+    if (startDate && endDate) {
+      form.append('start_date', startDate);
+      form.append('end_date', endDate);
+    } else {
+      form.append('period', period);
+    }
+    if (activeAgents) form.append('active_agents', JSON.stringify(activeAgents));
+    if (agentParams) form.append('agent_params', JSON.stringify(agentParams));
+    form.append('custom_data', csvFile);
+    const res = await api.post('/api/init', form, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return res.data;
+  }
+
+  const body = { ticker, interval };
+  if (startDate && endDate) {
+    body.start_date = startDate;
+    body.end_date = endDate;
+  } else {
+    body.period = period;
+  }
   if (activeAgents) body.active_agents = activeAgents;
   if (agentParams) body.agent_params = agentParams;
-  const res = await api.post('/api/init', body);
+  const res = await api.post('/api/init', body, {
+    headers: { 'Content-Type': 'application/json' },
+  });
   return res.data;
 }
 
@@ -65,4 +100,21 @@ export async function liquidateAgent(agentKey) {
 export async function getOllamaModels() {
   const res = await api.get('/api/ollama-models');
   return res.data;
+}
+
+/** Run optimizer parameter sweep */
+export async function optimizeSimulation(payload) {
+  try {
+    const res = await api.post('/api/optimize', payload, {
+      headers: { 'Content-Type': 'application/json' },
+    });
+    const data = res?.data || {};
+    if (!Array.isArray(data.results)) {
+      data.results = [];
+    }
+    return data;
+  } catch (err) {
+    const msg = err?.response?.data?.error || err?.message || 'Optimizer request failed';
+    throw new Error(msg);
+  }
 }

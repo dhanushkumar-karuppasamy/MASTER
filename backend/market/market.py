@@ -22,7 +22,57 @@ import pandas as pd
 import numpy as np
 
 
-def download_market_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
+def _merge_custom_columns(market_df: pd.DataFrame, custom_data_df: pd.DataFrame | None) -> pd.DataFrame:
+    """Merge user-uploaded custom CSV columns into market data by calendar date."""
+    if custom_data_df is None or custom_data_df.empty:
+        return market_df
+
+    df_market = market_df.copy()
+    df_custom = custom_data_df.copy()
+
+    date_col = None
+    for c in df_custom.columns:
+        if str(c).strip().lower() == "date":
+            date_col = c
+            break
+    if date_col is None:
+        raise ValueError("Custom CSV must include a 'Date' column.")
+
+    df_custom[date_col] = pd.to_datetime(df_custom[date_col], errors="coerce")
+    df_custom = df_custom.dropna(subset=[date_col]).copy()
+    if df_custom.empty:
+        return df_market
+
+    # Build date-only merge key to support daily signals on intraday bars.
+    df_market["__merge_date"] = pd.to_datetime(df_market["Datetime"], errors="coerce").dt.date
+    df_custom["__merge_date"] = pd.to_datetime(df_custom[date_col], errors="coerce").dt.date
+
+    drop_cols = {date_col, "__merge_date"}
+    custom_cols = [c for c in df_custom.columns if c not in drop_cols]
+
+    # If duplicates exist on same date, keep the last uploaded row.
+    df_custom = df_custom.drop_duplicates(subset=["__merge_date"], keep="last")
+    merged = df_market.merge(
+        df_custom[["__merge_date", *custom_cols]],
+        on="__merge_date",
+        how="left",
+    )
+
+    if custom_cols:
+        merged[custom_cols] = merged[custom_cols].ffill()
+
+    merged.drop(columns=["__merge_date"], inplace=True)
+    return merged
+
+
+def download_market_data(
+    ticker: str,
+    period: str,
+    interval: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    custom_data_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     """
     Download historical market data using yfinance.
 
@@ -39,7 +89,14 @@ def download_market_data(ticker: str, period: str, interval: str) -> pd.DataFram
         ValueError if no data could be downloaded.
     """
     ticker_obj = yf.Ticker(ticker)
-    df = ticker_obj.history(period=period, interval=interval)
+    requested_start = pd.to_datetime(start_date).tz_localize(None) if start_date else None
+
+    if start_date and end_date:
+        # Pull an additional lookback window so indicators are valid from day 1.
+        lookback_start = (requested_start - pd.Timedelta(days=120)).strftime("%Y-%m-%d")
+        df = ticker_obj.history(start=lookback_start, end=end_date, interval=interval)
+    else:
+        df = ticker_obj.history(period=period, interval=interval)
 
     if df is None or df.empty:
         raise ValueError(
@@ -63,6 +120,19 @@ def download_market_data(ticker: str, period: str, interval: str) -> pd.DataFram
 
     # Drop duplicate timestamps (yfinance can return duplicates at day boundaries)
     df = df.drop_duplicates(subset=["Datetime"], keep="last").reset_index(drop=True)
+
+    # Merge optional user-supplied alternative dataset.
+    df = _merge_custom_columns(df, custom_data_df)
+
+    if end_date:
+        requested_end = pd.to_datetime(end_date).tz_localize(None)
+        dt = pd.to_datetime(df["Datetime"], errors="coerce")
+        df = df.loc[dt <= requested_end].reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError(
+            f"No rows available for ticker='{ticker}' in requested date range."
+        )
 
     return df
 
@@ -94,11 +164,16 @@ class MarketEnvironment:
         ticker: str,
         period: str,
         interval: str,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        custom_data_df: pd.DataFrame | None = None,
         sensitivity_factor: float | None = None,
     ):
         self.ticker = ticker
         self.period = period
         self.interval = interval
+        self.start_date = start_date
+        self.end_date = end_date
         self.current_step = 0
 
         # ----- Endogenous Price Impact – sensitivity coefficient ------
@@ -109,8 +184,15 @@ class MarketEnvironment:
             else self.DEFAULT_SENSITIVITY
         )
 
-        # Download raw historical data
-        self.df = download_market_data(ticker, period, interval)
+        # Download raw historical data (with optional date range / custom columns)
+        self.df = download_market_data(
+            ticker,
+            period,
+            interval,
+            start_date=start_date,
+            end_date=end_date,
+            custom_data_df=custom_data_df,
+        )
 
         # ---------- Pre-compute technical indicators (on historical) --
         # NOTE: indicators are always computed on the raw historical
@@ -133,6 +215,16 @@ class MarketEnvironment:
 
         # Fill any remaining NaNs with 0
         self.df.fillna(0, inplace=True)
+
+        # For explicit historical stress tests, keep only rows from requested
+        # start date onward *after* indicators are computed with lookback data.
+        if start_date:
+            requested_start = pd.to_datetime(start_date).tz_localize(None)
+            dt = pd.to_datetime(self.df["Datetime"], errors="coerce")
+            self.df = self.df.loc[dt >= requested_start].reset_index(drop=True)
+
+        if self.df.empty:
+            raise ValueError("No market data available after applying requested start_date/end_date.")
 
         # Total number of bars available
         self.total_bars = len(self.df)
