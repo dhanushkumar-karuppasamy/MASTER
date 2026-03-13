@@ -20,6 +20,7 @@ DevHack 2026 architecture:
 
 from simulation.orchestrator import OrchestratorAgent
 from db import SimulationDB
+import pandas as pd
 
 
 class Simulation:
@@ -53,12 +54,47 @@ class Simulation:
         interval: str,
         active_agents: list[str] | None = None,
         agent_params: dict | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        custom_data_df: pd.DataFrame | None = None,
     ) -> dict:
         """Initialise / re-initialise the simulation.  Delegates to OrchestratorAgent."""
         return self.orchestrator.init(
             ticker, period, interval,
             active_agents=active_agents,
             agent_params=agent_params,
+            start_date=start_date,
+            end_date=end_date,
+            custom_data_df=custom_data_df,
+        )
+
+    def optimize(
+        self,
+        ticker: str,
+        period: str,
+        interval: str,
+        active_agents: list[str] | None,
+        agent_params: dict | None,
+        parameter: str,
+        min_value: float,
+        max_value: float,
+        step_value: float,
+        start_date: str | None = None,
+        end_date: str | None = None,
+    ) -> dict:
+        """Run headless optimization sweep. Delegates to OrchestratorAgent.optimize()."""
+        return self.orchestrator.optimize(
+            ticker=ticker,
+            period=period,
+            interval=interval,
+            active_agents=active_agents,
+            agent_params=agent_params,
+            parameter=parameter,
+            min_value=min_value,
+            max_value=max_value,
+            step_value=step_value,
+            start_date=start_date,
+            end_date=end_date,
         )
 
     def step_simulation(self) -> dict:

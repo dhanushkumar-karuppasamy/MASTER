@@ -6,9 +6,9 @@ Custom Agent – user-defined strategy via JSON recipe.
 This agent is an **autonomous, goal-driven, rule-based decision maker**
 whose strategy is defined by a JSON "recipe" built in the frontend Builder.
 
-Security note: NO eval(), exec(), or raw code injection is used.
-The recipe is a structured dict that is parsed into safe rule checks
-against pre-defined indicator keys and arithmetic comparisons.
+Security note: recipe modes basic/advanced/llm are structured and safe-parsed.
+The optional code mode intentionally executes a user-provided Python function
+inside a constrained namespace and always falls back to HOLD on error.
 
 Supported recipe format (V1)
 -----------------------------
@@ -47,6 +47,7 @@ Supported ops: "<", "<=", ">", ">=", "==", "!="
 """
 
 import json
+import traceback
 import requests
 import logging
 
@@ -163,9 +164,25 @@ _BASIC_EXIT_RULES = {
     "stop_loss",
 }
 
+_CODE_SAFE_BUILTINS = {
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "len": len,
+    "round": round,
+    "int": int,
+    "float": float,
+    "bool": bool,
+    "str": str,
+    "dict": dict,
+    "list": list,
+}
+
 
 def _resolve_indicator(key: str, obs: dict) -> float:
     """Map an indicator key to its current numeric value from obs dict."""
+    key_l = str(key).lower()
     mapping = {
         "price":      obs.get("close", 0.0),
         "sma20":      obs.get("sma20", obs.get("close", 0.0)),
@@ -178,7 +195,11 @@ def _resolve_indicator(key: str, obs: dict) -> float:
         "held_qty":   obs.get("held_qty", 0.0),
         "cash_ratio": obs.get("cash_ratio", 1.0),
     }
-    return float(mapping.get(key, 0.0))
+    value = mapping.get(key_l, obs.get(key, obs.get(key_l, 0.0)))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _eval_condition(cond: dict, obs: dict) -> bool:
@@ -230,6 +251,9 @@ class CustomAgent(TradingAgent):
         self._llm_step_counter = 0
         self._llm_cached_decision: dict | None = None
 
+        # Code mode source
+        self._code_python = str(self._recipe.get("code", {}).get("python", ""))
+
         # Pre-warm the model into VRAM on agent creation (avoids cold-start timeout)
         if self._recipe.get("mode") == "llm":
             import threading
@@ -250,7 +274,7 @@ class CustomAgent(TradingAgent):
         vol    = bar.get("Volatility", 0.0)
         volume = bar.get("Volume", 0.0)
 
-        return {
+        obs = {
             "ticker":     ticker,
             "close":      close,
             "sma20":      sma20,
@@ -264,6 +288,27 @@ class CustomAgent(TradingAgent):
             "cash_ratio": self.cash / self.initial_cash if self.initial_cash > 0 else 1.0,
         }
 
+        # Forward any extra/custom market columns for advanced/code recipes.
+        reserved = {
+            "Datetime", "Open", "High", "Low", "Close", "Volume",
+            "SMA20", "SMA50", "BB_MID", "BB_UP", "BB_LOW", "Volatility",
+            "SimulatedPrice", "ticker",
+        }
+        custom_features = {}
+        for k, v in bar.items():
+            if k in reserved:
+                continue
+            if isinstance(v, (int, float, str, bool)) or v is None:
+                custom_features[k] = v
+                if k not in obs:
+                    obs[k] = v
+                lk = str(k).lower()
+                if lk not in obs:
+                    obs[lk] = v
+
+        obs["custom_features"] = custom_features
+        return obs
+
     # -- reason (dispatch to mode) ------------------------------------------
 
     def reason(self, observation: dict) -> dict:
@@ -271,11 +316,98 @@ class CustomAgent(TradingAgent):
             return {"action": "HOLD", "ticker": "", "quantity": 0, "reasoning": "No valid observation"}
 
         mode = self._recipe.get("mode", "basic")
+        if mode == "code":
+            return self._reason_code(observation)
         if mode == "llm":
             return self._reason_llm(observation)
         elif mode == "advanced":
             return self._reason_advanced(observation)
         return self._reason_basic(observation)
+
+    # -- CODE mode ----------------------------------------------------------
+
+    def _reason_code(self, obs: dict) -> dict:
+        ticker = obs.get("ticker", "")
+        source = str(self._recipe.get("code", {}).get("python", self._code_python or ""))
+        if not source.strip():
+            return {
+                "action": "HOLD",
+                "ticker": ticker,
+                "quantity": 0,
+                "reasoning": "Code mode enabled but no Python source provided",
+            }
+
+        portfolio = {
+            "cash": self.cash,
+            "initial_cash": self.initial_cash,
+            "positions": dict(self.positions),
+            "avg_cost": dict(self.avg_cost),
+            "followers": getattr(self, "followers", 1),
+        }
+
+        try:
+            sandbox_globals = {"__builtins__": _CODE_SAFE_BUILTINS}
+            sandbox_locals: dict = {}
+            exec(source, sandbox_globals, sandbox_locals)
+
+            fn = sandbox_locals.get("make_decision") or sandbox_globals.get("make_decision")
+            if not callable(fn):
+                raise ValueError("Python code must define callable make_decision(market_state, portfolio)")
+
+            result = fn(dict(obs), portfolio)
+            if not isinstance(result, dict):
+                raise TypeError("make_decision must return a dict")
+
+            action = str(result.get("action", "HOLD")).upper()
+            quantity = result.get("quantity", 0)
+            reasoning = str(result.get("reasoning", "code decision"))
+
+            if action not in ("BUY", "SELL", "HOLD"):
+                action = "HOLD"
+                quantity = 0
+                reasoning = f"Invalid action in code output; forced HOLD. {reasoning}"
+
+            try:
+                quantity = int(float(quantity))
+            except (TypeError, ValueError):
+                quantity = 0
+
+            if quantity < 0:
+                quantity = 0
+
+            if action == "BUY":
+                price = float(obs.get("close", 0.0) or 0.0)
+                if price <= 0:
+                    return {"action": "HOLD", "ticker": ticker, "quantity": 0, "reasoning": "Invalid price for BUY"}
+                max_qty = int(self.cash / price)
+                quantity = min(quantity, max_qty)
+                if quantity <= 0:
+                    return {"action": "HOLD", "ticker": ticker, "quantity": 0, "reasoning": "BUY quantity is zero or exceeds cash"}
+
+            if action == "SELL":
+                held = int(self.positions.get(ticker, 0))
+                quantity = min(quantity, held)
+                if quantity <= 0:
+                    return {"action": "HOLD", "ticker": ticker, "quantity": 0, "reasoning": "SELL quantity is zero or no holdings"}
+
+            if action == "HOLD":
+                quantity = 0
+
+            return {
+                "action": action,
+                "ticker": ticker,
+                "quantity": quantity,
+                "reasoning": f"[CODE] {reasoning}",
+            }
+        except Exception:
+            tb = traceback.format_exc(limit=8)
+            logger.exception("Custom code execution failed")
+            return {
+                "action": "HOLD",
+                "ticker": ticker,
+                "quantity": 0,
+                "reasoning": f"[CODE ERROR] {tb}",
+            }
 
     # -- BASIC mode ---------------------------------------------------------
 

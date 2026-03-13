@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import Editor from '@monaco-editor/react';
 import { getOllamaModels } from '../api/client';
 
 const C = {
@@ -120,6 +121,14 @@ const newRule = () => ({
   size_pct: 0.10,
 });
 
+const DEFAULT_CODE_TEMPLATE = `def make_decision(market_state, portfolio):
+    return {
+        "action": "HOLD",
+        "quantity": 0,
+        "reasoning": "default"
+    }
+`;
+
 export default function BuilderPanel({ agentParams, setAgentParams, activeAgents, setActiveAgents, onApplyAndInit }) {
   const [mode, setMode] = useState('basic');
   const [basic, setBasic] = useState({ ...DEFAULT_BASIC });
@@ -128,6 +137,7 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
   const [goal, setGoal] = useState('');
   const [strategyName, setStrategyName] = useState('');
   const [nameError, setNameError] = useState(false);
+  const [codePython, setCodePython] = useState(DEFAULT_CODE_TEMPLATE);
 
   // LLM mode state
   const [llmModels, setLlmModels] = useState([]);
@@ -159,6 +169,10 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
     const recipe = { mode };
     if (mode === 'basic') {
       recipe.basic = { ...basic };
+    } else if (mode === 'code') {
+      recipe.code = {
+        python: codePython,
+      };
     } else if (mode === 'llm') {
       recipe.llm = {
         model: llmModel,
@@ -257,14 +271,14 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
           Define a rule-based trading strategy, save it as the <strong style={{ color: C.green }}>Custom</strong> agent,
           then Initialize the simulation to run it alongside the built-in agents.
           Your strategy name will appear on charts, logs, and the dynamic summary.
-          No code required — no eval() or exec() ever runs.
+          Basic and Advanced modes need no coding; Code mode lets you provide a Python decision function.
         </p>
       </div>
 
       {/* Mode selector */}
       <div className="card" style={{ padding: '14px 20px' }}>
         <div style={{ display: 'flex', gap: 8, marginBottom: 4 }}>
-          {['basic', 'advanced', 'llm'].map(m => (
+          {['basic', 'advanced', 'code', 'llm'].map(m => (
             <button
               key={m}
               onClick={() => setMode(m)}
@@ -277,13 +291,15 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
                 transition: 'all 0.15s',
               }}
             >
-              {m === 'llm' ? '🧠 LLM' : m.charAt(0).toUpperCase() + m.slice(1)}
+              {m === 'llm' ? '🧠 LLM' : m === 'code' ? '💻 Code' : m.charAt(0).toUpperCase() + m.slice(1)}
             </button>
           ))}
         </div>
         <p style={{ fontSize: 10, color: C.muted, fontFamily: "'JetBrains Mono', monospace", marginTop: 6 }}>
           {mode === 'basic'
             ? 'Simple entry/exit rule selection with position size.'
+            : mode === 'code'
+            ? 'Write Python make_decision(market_state, portfolio) for full sandboxed strategy control.'
             : mode === 'llm'
             ? 'Local LLM (Ollama) makes autonomous trading decisions each step.'
             : 'IF-THEN rule builder: mix indicators, operators, and actions with AND/OR logic.'}
@@ -400,6 +416,36 @@ export default function BuilderPanel({ agentParams, setAgentParams, activeAgents
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Code Mode */}
+      {mode === 'code' && (
+        <div className="card" style={{ padding: '18px 20px' }}>
+          <h3 style={{ fontSize: 12, color: C.green, marginBottom: 14, fontFamily: "'JetBrains Mono', monospace", textTransform: 'uppercase', letterSpacing: 0.8 }}>
+            Python Sandbox
+          </h3>
+          <p style={{ fontSize: 10, color: C.muted, fontFamily: "'JetBrains Mono', monospace", marginBottom: 10, lineHeight: 1.5 }}>
+            Implement <code style={{ color: C.cyan }}>make_decision(market_state, portfolio)</code> and return
+            {' '}<code style={{ color: C.amber }}>{'{"action":"BUY|SELL|HOLD","quantity":number,"reasoning":"text"}'}</code>.
+          </p>
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 8, overflow: 'hidden' }}>
+            <Editor
+              height="320px"
+              defaultLanguage="python"
+              theme="vs-dark"
+              value={codePython}
+              onChange={v => setCodePython(v || DEFAULT_CODE_TEMPLATE)}
+              options={{
+                minimap: { enabled: false },
+                fontSize: 12,
+                fontFamily: "'JetBrains Mono', monospace",
+                lineNumbers: 'on',
+                scrollBeyondLastLine: false,
+                automaticLayout: true,
+              }}
+            />
+          </div>
         </div>
       )}
 

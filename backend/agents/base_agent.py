@@ -72,6 +72,12 @@ class TradingAgent:
         Subclasses should override this to extract specific indicators.
         """
         self._state = market_state
+        if isinstance(market_state, dict):
+            current_bar = market_state.get("current_bar", {})
+            if isinstance(current_bar, dict):
+                enriched = dict(market_state)
+                enriched["market_features"] = dict(current_bar)
+                return enriched
         return market_state
 
     def reason(self, observation: dict) -> dict:

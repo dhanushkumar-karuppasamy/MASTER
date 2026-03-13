@@ -6,6 +6,7 @@ const PERIODS = ['1d', '5d', '1mo', '3mo'];
 export default function TopBar({
   ticker, setTicker,
   period, setPeriod,
+  periodLocked = false,
   theme, setTheme,
   balance = 0,
   crashActive = false,
@@ -29,14 +30,12 @@ export default function TopBar({
             value={period} 
             onChange={e => setPeriod(e.target.value)}
             className="period-dropdown"
+            disabled={periodLocked}
+            title={periodLocked ? 'Disabled while historical stress test is selected' : 'Select period'}
           >
             {PERIODS.map(p => <option key={p} value={p}>{p}</option>)}
           </select>
         </div>
-      </div>
-
-      <div className="topbar-center">
-        <h1>MASTER — Multi-Agent Stockmarket Trading Environment for Research</h1>
       </div>
 
       <div className="topbar-right">

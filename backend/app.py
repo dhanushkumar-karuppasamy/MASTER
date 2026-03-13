@@ -25,7 +25,9 @@ Endpoints:
 
 import sys
 import os
+import json
 import requests as http_requests
+import pandas as pd
 
 # Ensure the backend directory is on the Python path so relative imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -58,24 +60,103 @@ def init_simulation():
             "agent_params":  { "conservative": { "risk_pct": 0.05 }, ... }  // optional
         }
     """
-    data = request.get_json(force=True, silent=True) or {}
-    ticker = data.get("ticker", "AAPL")
-    period = data.get("period", "5d")
-    interval = data.get("interval", "5m")
-    active_agents = data.get("active_agents", None)
-    agent_params = data.get("agent_params", None)
+    is_multipart = "multipart/form-data" in (request.content_type or "")
+
+    custom_data_df = None
+    start_date = None
+    end_date = None
+
+    if is_multipart:
+        ticker = request.form.get("ticker", "AAPL")
+        period = request.form.get("period", "5d")
+        interval = request.form.get("interval", "5m")
+        start_date = request.form.get("start_date") or None
+        end_date = request.form.get("end_date") or None
+
+        active_agents_raw = request.form.get("active_agents")
+        agent_params_raw = request.form.get("agent_params")
+        active_agents = json.loads(active_agents_raw) if active_agents_raw else None
+        agent_params = json.loads(agent_params_raw) if agent_params_raw else None
+
+        csv_file = request.files.get("custom_data")
+        if csv_file and csv_file.filename:
+            custom_data_df = pd.read_csv(csv_file)
+    else:
+        data = request.get_json(force=True, silent=True) or {}
+        ticker = data.get("ticker", "AAPL")
+        period = data.get("period", "5d")
+        interval = data.get("interval", "5m")
+        active_agents = data.get("active_agents", None)
+        agent_params = data.get("agent_params", None)
+        start_date = data.get("start_date")
+        end_date = data.get("end_date")
 
     try:
         snapshot = simulation.init_simulation(
             ticker, period, interval,
             active_agents=active_agents,
             agent_params=agent_params,
+            start_date=start_date,
+            end_date=end_date,
+            custom_data_df=custom_data_df,
         )
         return jsonify(snapshot)
     except ValueError as e:
         return jsonify({"error": str(e)}), 400
     except Exception as e:
         return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
+
+
+# ------------------------------------------------------------------ #
+# POST /api/optimize
+# ------------------------------------------------------------------ #
+@app.route("/api/optimize", methods=["POST"])
+def optimize_simulation():
+    """
+    Run headless parameter sweep optimization and return trial metrics.
+
+    Request body (JSON):
+        {
+            "ticker": "AAPL",
+            "period": "5d",
+            "interval": "5m",
+            "active_agents": [...],
+            "agent_params": {...},
+            "parameter": "custom.basic.position_size_pct",
+            "min": 0.05,
+            "max": 0.25,
+            "step": 0.05,
+            "start_date": "2020-02-01",   // optional
+            "end_date": "2020-04-30"       // optional
+        }
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    try:
+        results = simulation.optimize(
+            ticker=data.get("ticker", "AAPL"),
+            period=data.get("period", "5d"),
+            interval=data.get("interval", "5m"),
+            active_agents=data.get("active_agents"),
+            agent_params=data.get("agent_params"),
+            parameter=data.get("parameter"),
+            min_value=data.get("min"),
+            max_value=data.get("max"),
+            step_value=data.get("step"),
+            start_date=data.get("start_date"),
+            end_date=data.get("end_date"),
+        )
+        if not isinstance(results, dict):
+            results = {"results": []}
+        if not isinstance(results.get("results"), list):
+            results["results"] = []
+        if "error" in results and not results["results"]:
+            results["results"].append({"error": results["error"]})
+        return jsonify(results)
+    except Exception as e:
+        return jsonify({
+            "error": str(e),
+            "results": [{"error": str(e)}],
+        }), 500
 
 
 # ------------------------------------------------------------------ #
