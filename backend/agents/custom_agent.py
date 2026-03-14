@@ -67,6 +67,62 @@ Format: {"action":"BUY"|"SELL"|"HOLD","confidence":0.0-1.0,"reasoning":"brief"}
 Use SMA crossover, Bollinger Bands, volatility. Be concise (under 40 words)."""
 
 
+def _extract_json_object(raw_text: str) -> dict:
+    """Extract the first valid JSON object from an LLM response string."""
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("Empty LLM response")
+
+    decoder = json.JSONDecoder()
+    candidates: list[dict] = []
+
+    # Scan for one or more JSON objects embedded in free-form text.
+    i = 0
+    while i < len(text):
+        if text[i] != "{":
+            i += 1
+            continue
+        try:
+            obj, consumed = decoder.raw_decode(text[i:])
+            if isinstance(obj, dict):
+                candidates.append(obj)
+            i += max(consumed, 1)
+        except json.JSONDecodeError:
+            i += 1
+
+    if not candidates:
+        raise ValueError("No JSON object found in LLM response")
+
+    # Prefer the object that looks like our trading schema.
+    for obj in candidates:
+        if any(k in obj for k in ("action", "confidence", "reasoning")):
+            return obj
+    return candidates[0]
+
+
+def _clean_reasoning_text(reasoning: str) -> str:
+    """Normalize reasoning text for UI display and cache reuse."""
+    text = str(reasoning or "").strip()
+    # Strip internal/debug tags that may accidentally leak into cached display.
+    for tag in ("[LLM cached]", "LLM cached]", "[LLM:"):
+        if tag == "[LLM:":
+            # Remove model tag forms like: [LLM:qwen2.5:3b]
+            while text.startswith("[LLM:"):
+                close_idx = text.find("]")
+                if close_idx == -1:
+                    break
+                text = text[close_idx + 1 :].strip()
+        else:
+            text = text.replace(tag, "").strip()
+
+    # Remove leading punctuation left behind after tag stripping.
+    while text and text[0] in ",;:-":
+        text = text[1:].strip()
+
+    # Keep it compact for table cells.
+    return " ".join(text.split())
+
+
 def _warmup_model(model: str) -> None:
     """Send a tiny request to pre-load the model into VRAM (avoids cold-start)."""
     try:
@@ -96,6 +152,7 @@ def _call_ollama(model: str, prompt: str, timeout: float = 90.0) -> dict:
                 "model": model,
                 "prompt": prompt,
                 "system": _LLM_SYSTEM_PROMPT,
+                "format": "json",
                 "stream": False,
                 "keep_alive": "30m",
                 "options": {
@@ -118,11 +175,14 @@ def _call_ollama(model: str, prompt: str, timeout: float = 90.0) -> dict:
             end = cleaned.rfind("}") + 1
             if start >= 0 and end > start:
                 cleaned = cleaned[start:end]
-        
-        parsed = json.loads(cleaned)
+
+        parsed = _extract_json_object(cleaned)
+        action = str(parsed.get("action", "HOLD")).upper()
+        confidence = float(parsed.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))
         return {
-            "action": str(parsed.get("action", "HOLD")).upper(),
-            "confidence": float(parsed.get("confidence", 0.5)),
+            "action": action,
+            "confidence": confidence,
             "reasoning": str(parsed.get("reasoning", "LLM provided no reasoning.")),
         }
     except requests.exceptions.ConnectionError:
@@ -552,7 +612,8 @@ class CustomAgent(TradingAgent):
                 cached["quantity"] = qty
                 if qty <= 0:
                     cached["action"] = "HOLD"
-            cached["reasoning"] = f"[LLM cached] {cached.get('reasoning', '')}"
+            base_reasoning = _clean_reasoning_text(cached.get("reasoning", ""))
+            cached["reasoning"] = f"[LLM cached] {base_reasoning}" if base_reasoning else "[LLM cached]"
             return cached
 
         # ---- Build compact prompt ----
@@ -573,7 +634,7 @@ class CustomAgent(TradingAgent):
         llm_result = _call_ollama(self._llm_model, prompt, timeout=self._llm_timeout)
         action = llm_result["action"]
         confidence = llm_result["confidence"]
-        reasoning = llm_result["reasoning"]
+        reasoning = _clean_reasoning_text(llm_result["reasoning"])
 
         # Validate action
         if action not in ("BUY", "SELL", "HOLD"):
@@ -593,14 +654,17 @@ class CustomAgent(TradingAgent):
                 action = "HOLD"
                 reasoning += " (no position to SELL)"
 
-        # Cache this decision
-        self._llm_cached_decision = {
-            "action": action,
-            "ticker": ticker,
-            "quantity": quantity,
-            "reasoning": reasoning,
-            "_confidence": confidence,
-        }
+        # Cache only successful semantic decisions; avoid replaying transient errors.
+        if not reasoning.startswith("LLM "):
+            self._llm_cached_decision = {
+                "action": action,
+                "ticker": ticker,
+                "quantity": quantity,
+                "reasoning": reasoning,
+                "_confidence": confidence,
+            }
+        else:
+            self._llm_cached_decision = None
 
         tag = f"[LLM:{self._llm_model}] "
         return {
