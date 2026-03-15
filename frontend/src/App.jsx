@@ -80,6 +80,7 @@ export default function App() {
   // ---- Run state ----
   const [status, setStatus] = useState('idle'); // idle | paused | running | finished
   const autoRef = useRef(null);
+  const runTokenRef = useRef(0);
 
   // ---- Crash flash ----
   const [crashFlash, setCrashFlash] = useState(false);
@@ -98,6 +99,11 @@ export default function App() {
 
   // ---- Helpers ----
 
+  const customAgentLabel = (agentParams?.custom?.name || '').trim() || 'Custom';
+  const allAgentsWithCustomLabel = ALL_AGENTS.map(a => (
+    a.key === 'custom' ? { ...a, label: customAgentLabel } : a
+  ));
+
   /** Merge followers into agentParams before sending to backend */
   const buildParamsWithFollowers = useCallback(() => {
     const merged = JSON.parse(JSON.stringify(agentParams));
@@ -112,6 +118,7 @@ export default function App() {
 
   const handleInit = useCallback(async (overrides = {}) => {
     setError(null);
+    runTokenRef.current += 1;
     if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; }
     try {
       const params = buildParamsWithFollowers();
@@ -179,10 +186,15 @@ export default function App() {
   }, [batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers]);
 
   const handleAutoRun = useCallback(() => {
+    const runToken = runTokenRef.current + 1;
+    runTokenRef.current = runToken;
     setStatus('running');
+
     const runNext = async () => {
+      if (runToken !== runTokenRef.current) return;
       try {
         const data = await stepSimulation(batchSize);
+        if (runToken !== runTokenRef.current) return;
         if (data.error) {
           // If backend lost state (e.g. server restart), auto-re-init and resume
           if (typeof data.error === 'string' && data.error.includes('not initialised')) {
@@ -190,6 +202,7 @@ export default function App() {
             try {
               const params = buildParamsWithFollowers();
               const reinit = await initSimulation(ticker, period, interval_, activeAgents, params);
+              if (runToken !== runTokenRef.current) return;
               if (!reinit.error) {
                 setSnapshot(reinit);
                 setError(null);
@@ -213,6 +226,7 @@ export default function App() {
         // Schedule next step only after current one completes
         autoRef.current = setTimeout(runNext, speedMs);
       } catch (err) {
+        if (runToken !== runTokenRef.current) return;
         autoRef.current = null;
         setError(err.response?.data?.error || err.message);
         setStatus('paused');
@@ -222,6 +236,7 @@ export default function App() {
   }, [speedMs, batchSize, ticker, period, interval_, activeAgents, buildParamsWithFollowers]);
 
   const handlePause = useCallback(() => {
+    runTokenRef.current += 1;
     if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; }
     setStatus('paused');
   }, []);
@@ -231,6 +246,7 @@ export default function App() {
     if (targetStep > maxReachedStep) return;
     if (jumpingRef.current) return;
     jumpingRef.current = true;
+    runTokenRef.current += 1;
     if (autoRef.current) { clearTimeout(autoRef.current); autoRef.current = null; setStatus('paused'); }
     try {
       const data = await jumpToStep(targetStep);
@@ -454,7 +470,7 @@ export default function App() {
           batchSize={batchSize}
           setBatchSize={setBatchSize}
           activeAgents={activeAgents}
-          allAgents={ALL_AGENTS}
+          allAgents={allAgentsWithCustomLabel}
           toggleAgent={toggleAgent}
           agentFollowers={agentFollowers}
           setAgentFollowers={setAgentFollowers}

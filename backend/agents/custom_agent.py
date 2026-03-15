@@ -47,6 +47,7 @@ Supported ops: "<", "<=", ">", ">=", "==", "!="
 """
 
 import json
+import ast
 import requests
 import logging
 
@@ -64,6 +65,52 @@ DEFAULT_MODEL = "qwen2.5:3b"
 _LLM_SYSTEM_PROMPT = """You are a stock trading AI. Respond with ONLY JSON.
 Format: {"action":"BUY"|"SELL"|"HOLD","confidence":0.0-1.0,"reasoning":"brief"}
 Use SMA crossover, Bollinger Bands, volatility. Be concise (under 40 words)."""
+
+
+def _extract_first_json_object(text: str) -> dict:
+    """Extract and decode the first valid JSON object found in model text."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        raise json.JSONDecodeError("Empty LLM response", cleaned, 0)
+
+    # Remove markdown fences if present
+    if "```" in cleaned:
+        cleaned = cleaned.replace("```json", "").replace("```JSON", "").replace("```", "").strip()
+
+    decoder = json.JSONDecoder()
+    for i, ch in enumerate(cleaned):
+        if ch != "{":
+            continue
+        try:
+            obj, _end = decoder.raw_decode(cleaned[i:])
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            continue
+
+    # Fallback: some models emit Python-dict style output (single quotes, etc.)
+    first = cleaned.find("{")
+    last = cleaned.rfind("}")
+    if first >= 0 and last > first:
+        candidate = cleaned[first:last + 1]
+        try:
+            obj = ast.literal_eval(candidate)
+            if isinstance(obj, dict):
+                return obj
+        except Exception:
+            pass
+
+    raise json.JSONDecodeError("No valid JSON object in LLM response", cleaned, 0)
+
+
+def _is_unhealthy_reason(reasoning: str) -> bool:
+    txt = (reasoning or "").lower()
+    return (
+        "parse error" in txt
+        or "llm error" in txt
+        or "unreachable" in txt
+        or "timed out" in txt
+    )
 
 
 def _warmup_model(model: str) -> None:
@@ -109,33 +156,30 @@ def _call_ollama(model: str, prompt: str, timeout: float = 90.0) -> dict:
         raw = resp.json().get("response", "")
         logger.info(f"[LLM raw] {raw[:300]}")
 
-        # Try to extract JSON from the response
-        # Sometimes LLMs wrap it in ```json ...```
-        cleaned = raw.strip()
-        if "```" in cleaned:
-            start = cleaned.find("{")
-            end = cleaned.rfind("}") + 1
-            if start >= 0 and end > start:
-                cleaned = cleaned[start:end]
-        
-        parsed = json.loads(cleaned)
+        parsed = _extract_first_json_object(raw)
         return {
             "action": str(parsed.get("action", "HOLD")).upper(),
             "confidence": float(parsed.get("confidence", 0.5)),
             "reasoning": str(parsed.get("reasoning", "LLM provided no reasoning.")),
+            "_ok": True,
         }
     except requests.exceptions.ConnectionError:
         logger.error("Ollama not reachable at %s", OLLAMA_URL)
-        return {"action": "HOLD", "confidence": 0.0, "reasoning": "LLM unreachable (Ollama not running?)"}
+        return {"action": "HOLD", "confidence": 0.0, "reasoning": "LLM unreachable (Ollama not running?)", "_ok": False}
     except requests.exceptions.Timeout:
         logger.error("Ollama request timed out")
-        return {"action": "HOLD", "confidence": 0.0, "reasoning": "LLM request timed out"}
+        return {"action": "HOLD", "confidence": 0.0, "reasoning": "LLM request timed out", "_ok": False}
     except (json.JSONDecodeError, ValueError, KeyError) as e:
         logger.error("Failed to parse LLM response: %s — raw: %s", e, raw[:200])
-        return {"action": "HOLD", "confidence": 0.0, "reasoning": f"LLM response parse error: {e}"}
+        return {
+            "action": "HOLD",
+            "confidence": 0.0,
+            "reasoning": "LLM response parse error: invalid JSON output",
+            "_ok": False,
+        }
     except Exception as e:
         logger.error("Unexpected LLM error: %s", e)
-        return {"action": "HOLD", "confidence": 0.0, "reasoning": f"LLM error: {e}"}
+        return {"action": "HOLD", "confidence": 0.0, "reasoning": f"LLM error: {e}", "_ok": False}
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +270,7 @@ class CustomAgent(TradingAgent):
         self._llm_timeout = float(llm_cfg.get("timeout", 90))
 
         # LLM response cache — re-query only every N steps to avoid slowdown
-        self._llm_call_interval = int(llm_cfg.get("call_interval", 3))  # query LLM every N steps
+        self._llm_call_interval = max(1, int(llm_cfg.get("call_interval", 3)))  # query LLM every N steps
         self._llm_step_counter = 0
         self._llm_cached_decision: dict | None = None
 
@@ -403,6 +447,10 @@ class CustomAgent(TradingAgent):
 
         # ---- Cache: reuse last LLM decision for N steps to avoid slowdown ----
         self._llm_step_counter += 1
+        if self._llm_cached_decision and _is_unhealthy_reason(self._llm_cached_decision.get("reasoning", "")):
+            # Never keep recycling a broken/error decision from cache.
+            self._llm_cached_decision = None
+
         if (self._llm_cached_decision is not None
                 and self._llm_step_counter % self._llm_call_interval != 0):
             cached = self._llm_cached_decision.copy()
@@ -442,6 +490,13 @@ class CustomAgent(TradingAgent):
         action = llm_result["action"]
         confidence = llm_result["confidence"]
         reasoning = llm_result["reasoning"]
+        llm_ok = bool(llm_result.get("_ok", False))
+
+        if not llm_ok and self._llm_cached_decision is not None:
+            cached = self._llm_cached_decision.copy()
+            cached["ticker"] = ticker
+            cached["reasoning"] = f"[LLM fallback cache] {reasoning}"
+            return cached
 
         # Validate action
         if action not in ("BUY", "SELL", "HOLD"):
@@ -461,14 +516,15 @@ class CustomAgent(TradingAgent):
                 action = "HOLD"
                 reasoning += " (no position to SELL)"
 
-        # Cache this decision
-        self._llm_cached_decision = {
-            "action": action,
-            "ticker": ticker,
-            "quantity": quantity,
-            "reasoning": reasoning,
-            "_confidence": confidence,
-        }
+        # Cache only healthy LLM responses
+        if llm_ok:
+            self._llm_cached_decision = {
+                "action": action,
+                "ticker": ticker,
+                "quantity": quantity,
+                "reasoning": reasoning,
+                "_confidence": confidence,
+            }
 
         tag = f"[LLM:{self._llm_model}] "
         return {
